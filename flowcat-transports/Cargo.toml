@@ -1,0 +1,53 @@
+[package]
+name = "flowcat-transports"
+description = "Flowcat media transports: str0m WebRTC + Opus, WebSocket, Daily/LiveKit, local mic/speaker, and avatar transports — each behind a per-transport feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Every transport SDK is `optional` +
+# reached only via a `dep:`-gated feature, so a default build compiles nothing
+# but the trait re-exports + module stubs. Each transport flips an existing
+# feature on, never adds a dep line. The `MediaTransport`/`FrameSerializer` traits
+# + the TransportInput/Output processors stay in flowcat-core (frozen) — concrete
+# transports here compose the `SourcePump` helper for the input leg.
+[features]
+default = []
+# An async media transport is inherently I/O-bound, so each concrete
+# transport's feature also turns on the tokio runtime + tokio-util (UDP socket,
+# mpsc channels, task spawn/select, CancellationToken) — the same runtime
+# flowcat-core's SIP transport uses. tokio/tokio-util are `optional` and gated
+# so a default (stub-only) build still pulls nothing.
+webrtc-str0m = ["dep:str0m", "dep:audiopus", "dep:tokio", "dep:tokio-util"]
+ws           = ["dep:tokio-tungstenite", "dep:tokio", "dep:tokio-util"]
+daily        = ["dep:reqwest"]
+livekit      = []
+local        = ["dep:audiopus", "dep:tokio"]
+
+[dependencies]
+flowcat-core = { path = "../flowcat-core" }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+bytes = "1"
+
+# WebRTC stack (sans-I/O SFU/peer). (Spec §3 said 0.6; latest is 0.20.)
+str0m = { version = "0.20", optional = true }
+# libopus encode/decode for WebRTC + local audio. (Spec §3 said 0.3, which
+# is only a pre-release on crates.io; latest stable is 0.2.)
+audiopus = { version = "0.2", optional = true }
+# WebSocket transport.
+tokio-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Daily REST signaling.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+# Async runtime for the concrete transports (UDP/WS I/O + tasks). Optional +
+# feature-gated so a stub-only default build stays dependency-free. Matches the
+# tokio surface flowcat-core uses.
+tokio = { version = "1", optional = true, features = ["net", "rt", "sync", "macros", "time"] }
+tokio-util = { version = "0.7", optional = true, features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

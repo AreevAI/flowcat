@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-and-test:
+    name: fmt · clippy · build · test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable + rustfmt + clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: build (default features)
+        run: cargo build --workspace --locked
+      - name: test (offline fixture/wire suite)
+        run: cargo test --workspace --locked
+
+  test-all-connectors:
+    name: test every connector (gRPC + local)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # gRPC providers (Google/NVIDIA STT+TTS) codegen .proto via tonic-build.
+      # cmake + a C/C++ toolchain (for the local Whisper build) are preinstalled.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Set up Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo test` compiles every connector AND runs its offline fixture/wire
+      # tests (live tests are #[ignore]'d). These are feature-gated, so the
+      # default-features job above does not reach them.
+      - name: flowcat-core (vad-ort + filter-rnnoise)
+        run: cargo test -p flowcat-core --locked --features vad-ort,filter-rnnoise
+      - name: flowcat-services (every provider)
+        run: cargo test -p flowcat-services --locked --features stt-all,tts-all,llm-all,realtime-all,obs-all,mcp,brain-http
+      - name: flowcat-transports (every transport)
+        run: cargo test -p flowcat-transports --locked --features webrtc-str0m,ws,daily,livekit,local
+      - name: flowcat-telephony (every serializer)
+        run: cargo test -p flowcat-telephony --locked --features twilio,telnyx,exotel,vonage,genesys,asterisk,cloudonix,vobiz,dtmf-inband

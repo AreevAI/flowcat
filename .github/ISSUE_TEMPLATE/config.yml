@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/AreevAI/flowcat/security/advisories/new
+    about: Please report security issues privately — see SECURITY.md. Do not open a public issue.
+  - name: Question / discussion
+    url: https://github.com/AreevAI/flowcat/discussions
+    about: For questions and open-ended discussion, please use Discussions.

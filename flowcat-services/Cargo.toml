@@ -1,0 +1,218 @@
+[package]
+name = "flowcat-services"
+description = "Flowcat speech/LLM service providers: realtime S2S (Gemini sibling realtime providers), STT, TTS, LLM, and network observability exporters — each behind a per-provider feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# EVERY provider dep is declared
+# `optional` and reached only via a `dep:`-gated feature, so a default build
+# compiles NOTHING but the trait re-exports + module stubs (no network deps
+# pulled). Adding a provider flips an existing feature on — it never adds a
+# dep line or a `mod` decl. flowcat-core is the only
+# always-on dep (the frozen traits live there).
+[features]
+default = []
+# realtime — NEW realtime providers only; the Gemini client stays in
+# flowcat-core (re-exported as `flowcat_core::GeminiLive`).
+# Its goAway/reconnect enhancement edits flowcat-core in place. Moving Gemini to
+# this crate is deferred (would break dependents that re-export it from core).
+# Each realtime provider needs the async runtime (`tokio`: spawn/mpsc/sync) for
+# its reader task + the WS transport (`tokio-tungstenite`, rustls) + `base64`
+# for PCM (de)serialization — the same trio flowcat-core's Gemini client uses.
+realtime-openai = ["dep:tokio-tungstenite", "dep:tokio", "dep:base64"]
+realtime-azure  = ["realtime-openai"]
+# Grok (xAI) + Inworld are OpenAI-Realtime-compatible — they wrap the OpenAI
+# client (so they enable `realtime-openai`), differing only in endpoint + auth.
+realtime-grok    = ["realtime-openai"]
+realtime-inworld = ["realtime-openai"]
+# Ultravox (join-URL WS, binary PCM) + Nova Sonic (AWS Bedrock bidi envelopes)
+# have their own wire protocols — fixture-skeletons that encode/decode their key
+# messages; the live transport is feature-gated.
+# Ultravox sends raw binary PCM (no base64 envelope).
+realtime-ultravox  = ["dep:tokio-tungstenite", "dep:tokio"]
+realtime-novasonic = ["dep:tokio", "dep:base64"]
+# stt — see PROVIDERS.md §2 for the (D)istinct-vs-(W)rapper triage.
+# Streaming-WS providers carry tokio-tungstenite; Whisper-HTTP/REST carry reqwest;
+# google/nvidia(riva) carry tonic (gRPC); whisper-local carries whisper-rs (C build).
+stt-deepgram      = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) ref impl
+stt-assemblyai    = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-gladia        = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-soniox        = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-speechmatics  = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-cartesia      = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-azure         = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-gradium       = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]  # (D) WS
+stt-elevenlabs    = ["dep:reqwest", "dep:tokio"]                            # (D) segmented HTTP
+stt-sarvam        = ["dep:reqwest", "dep:tokio"]                            # (D) REST
+stt-mistral       = ["dep:reqwest", "dep:tokio"]                            # (D) REST
+stt-openai        = ["dep:reqwest", "dep:tokio"]                            # (D) Whisper-HTTP base
+stt-groq          = ["stt-openai"]                                          # (W) Whisper-HTTP
+stt-fal           = ["stt-openai"]                                          # (W) Whisper-HTTP
+stt-speaches      = ["stt-openai"]                                          # (W) Whisper-HTTP
+stt-xai           = ["stt-openai"]                                          # (W) Whisper-HTTP
+stt-google        = ["dep:tonic", "dep:tokio", "dep:bytes", "dep:http", "tonic/channel", "tonic/tls-aws-lc", "tonic/tls-webpki-roots"]  # (D) gRPC bidi (live transport)
+stt-nvidia        = ["dep:tonic", "dep:tokio"]                             # (D) gRPC (Riva)
+stt-aws-transcribe = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:hmac", "dep:sha2"]  # (D) SigV4 WS
+stt-whisper-local = ["dep:whisper-rs"]                                      # (D) local (C build: cmake)
+# tts — see PROVIDERS.md §3. Streaming-WS carry tokio-tungstenite +
+# base64; HTTP cloud carry reqwest (+ base64 where the body is base64 PCM);
+# google/nvidia carry tonic; aws_polly carries SigV4 (hmac/sha2).
+tts-cartesia    = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) ref impl
+tts-elevenlabs  = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-deepgram    = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-rime        = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-asyncai     = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-gradium     = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-soniox      = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-resemble    = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:base64"]  # (D) WS
+tts-openai      = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP base
+tts-groq        = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP
+tts-xai         = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP
+tts-speaches    = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP (self-hosted)
+tts-azure       = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]                 # (D) SSML WS/HTTP
+tts-sarvam      = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-mistral     = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-hume        = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-inworld     = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-minimax     = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-camb        = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
+tts-speechmatics = ["dep:reqwest", "dep:tokio"]                                         # (D) HTTP
+tts-fish        = ["dep:reqwest", "dep:tokio"]                                          # (D) interruptible HTTP
+tts-lmnt        = ["dep:reqwest", "dep:tokio"]                                          # (D) interruptible HTTP
+tts-neuphonic   = ["dep:reqwest", "dep:tokio"]                                          # (D) interruptible HTTP
+tts-smallest    = ["dep:reqwest", "dep:tokio"]                                          # (D) interruptible HTTP
+tts-kokoro      = ["dep:reqwest", "dep:tokio"]                                          # (D) local/model
+tts-piper       = ["dep:reqwest", "dep:tokio"]                                          # (D) local/model
+tts-xtts        = ["dep:reqwest", "dep:tokio"]                                          # (D) local/model
+tts-google      = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP (REST text:synthesize)
+tts-nvidia      = ["dep:tonic", "dep:tokio"]                                            # (D) gRPC (Riva)
+tts-aws-polly   = ["dep:reqwest", "dep:tokio", "dep:hmac", "dep:sha2"]                  # (D) SigV4
+# llm — see PROVIDERS.md §1. Almost all are OpenAI-compatible (W)
+# wrappers over llm-openai (a base_url + default-model change); only anthropic,
+# google(gemini), openai_responses, aws_bedrock are (D)istinct clients.
+llm-openai           = ["dep:reqwest", "dep:tokio"]   # (D) ref impl (chat-completions SSE)
+llm-openai-responses = ["dep:reqwest", "dep:tokio"]   # (D) Responses API
+llm-anthropic        = ["dep:reqwest", "dep:tokio"]   # (D) Messages API
+llm-google           = ["dep:reqwest", "dep:tokio"]   # (D) Gemini generateContent
+llm-google-vertex    = ["llm-google"]                 # (W) Vertex surface over the Gemini client
+llm-aws-bedrock      = ["dep:reqwest", "dep:tokio", "dep:hmac", "dep:sha2"]  # (D) SigV4 event-stream
+llm-groq        = ["llm-openai"]   # (W) base_url=api.groq.com/openai/v1
+llm-together    = ["llm-openai"]   # (W) base_url=api.together.xyz/v1
+llm-fireworks   = ["llm-openai"]   # (W) base_url=api.fireworks.ai/inference/v1
+llm-openrouter  = ["llm-openai"]   # (W) base_url=openrouter.ai/api/v1
+llm-perplexity  = ["llm-openai"]   # (W) base_url=api.perplexity.ai
+llm-deepseek    = ["llm-openai"]   # (W) base_url=api.deepseek.com/v1
+llm-cerebras    = ["llm-openai"]   # (W) base_url=api.cerebras.ai/v1
+llm-minimax     = ["llm-openai"]   # (W) base_url=api.minimax.io/v1
+llm-sambanova   = ["llm-openai"]   # (W) base_url=api.sambanova.ai/v1
+llm-nebius      = ["llm-openai"]   # (W) base_url=api.tokenfactory.nebius.com/v1
+llm-novita      = ["llm-openai"]   # (W) base_url=api.novita.ai/openai
+llm-qwen        = ["llm-openai"]   # (W) base_url=dashscope-intl.aliyuncs.com/compatible-mode/v1
+llm-grok        = ["llm-openai"]   # (W) base_url=api.x.ai/v1
+llm-nvidia-nim  = ["llm-openai"]   # (W) base_url=integrate.api.nvidia.com/v1
+llm-ollama      = ["llm-openai"]   # (W) base_url=localhost:11434/v1
+llm-sarvam      = ["llm-openai"]   # (W) base_url=api.sarvam.ai/v1
+llm-mistral     = ["llm-openai"]   # (W) base_url=api.mistral.ai/v1
+llm-azure       = ["llm-openai"]   # (W) Azure endpoint + api-key auth seam
+llm-speaches    = ["llm-openai"]   # (W) self-hosted OpenAI-compatible
+# observability exporters — the networked exporters that must stay out of core
+obs-otel     = ["dep:opentelemetry"]
+obs-sentry   = ["dep:reqwest"]
+obs-langfuse = ["dep:reqwest"]
+# MCP-as-processor — pulls an MCP client (HTTP) → lives here, not core.
+# `tokio` (net = async DNS for the SSRF guard, sync = OnceCell for the lazy
+# IP-pinned client) is already pulled transitively by reqwest — naming it here just
+# makes `tokio::net`/`tokio::sync` directly usable; it adds no new crate.
+mcp = ["dep:reqwest", "dep:tokio"]
+# Remote "brain" (HTTP webhook) adapter — a reference `AgentBrain` impl that drives
+# the conversation policy from an out-of-process HTTP service (Python/any language),
+# so an embedder need not write Rust to author the policy. Pulls `reqwest` (the JSON
+# webhook calls) + the multi-threaded tokio runtime: the sync `AgentBrain` trait
+# bridges to the async HTTP call via `block_in_place` + `Handle::block_on`, which
+# requires `tokio/rt-multi-thread` (the server default / `#[tokio::main]`).
+brain-http = ["dep:reqwest", "dep:tokio", "tokio/rt-multi-thread"]
+# umbrellas for CLI/tests — list EVERY provider in the category (PROVIDERS.md
+# §6: `--features stt-all,tts-all,llm-all` must compile every stub; whisper-local's
+# C build (cmake) is the one toolchain caveat, see §5).
+stt-all = [
+    "stt-deepgram", "stt-assemblyai", "stt-gladia", "stt-soniox", "stt-speechmatics",
+    "stt-cartesia", "stt-azure", "stt-gradium", "stt-elevenlabs", "stt-sarvam",
+    "stt-mistral", "stt-openai", "stt-groq", "stt-fal", "stt-speaches", "stt-xai",
+    "stt-google", "stt-nvidia", "stt-aws-transcribe", "stt-whisper-local",
+]
+tts-all = [
+    "tts-cartesia", "tts-elevenlabs", "tts-deepgram", "tts-rime", "tts-asyncai",
+    "tts-gradium", "tts-soniox", "tts-resemble", "tts-openai", "tts-groq", "tts-xai",
+    "tts-azure", "tts-sarvam", "tts-mistral", "tts-hume", "tts-inworld", "tts-minimax",
+    "tts-camb", "tts-speechmatics", "tts-fish", "tts-lmnt", "tts-neuphonic",
+    "tts-smallest", "tts-kokoro", "tts-piper", "tts-xtts", "tts-google", "tts-nvidia",
+    "tts-aws-polly",
+]
+llm-all = [
+    "llm-openai", "llm-openai-responses", "llm-anthropic", "llm-google",
+    "llm-aws-bedrock", "llm-groq", "llm-together", "llm-fireworks", "llm-openrouter",
+    "llm-perplexity", "llm-deepseek", "llm-cerebras", "llm-sambanova", "llm-nebius",
+    "llm-novita", "llm-qwen", "llm-grok", "llm-nvidia-nim", "llm-ollama", "llm-sarvam",
+    "llm-mistral", "llm-azure", "llm-speaches", "llm-minimax", "llm-google-vertex",
+]
+realtime-all = [
+    "realtime-openai",
+    "realtime-azure",
+    "realtime-grok",
+    "realtime-inworld",
+    "realtime-ultravox",
+    "realtime-novasonic",
+]
+obs-all      = ["obs-otel", "obs-sentry", "obs-langfuse"]
+
+[dependencies]
+# Always on: the frozen service traits + Frame enum the impls build against.
+flowcat-core = { path = "../flowcat-core" }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Per-provider optional deps — `dep:`-gated by the features above. Versions are
+# pre-verified to resolve; an implementation only flips a feature on.
+# HTTP (REST + SSE) providers (Deepgram/Cartesia/ElevenLabs/OpenAI/Anthropic/Daily/
+# Sentry/Langfuse/MCP).
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
+# WebSocket streaming providers (Deepgram/Cartesia/OpenAI-Realtime/Azure). Same
+# self-contained rustls TLS backend flowcat-core uses for the Gemini socket.
+tokio-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# tokio runtime — the streaming providers (realtime/STT/TTS/LLM) spawn reader
+# tasks + mpsc-bridge results (the reader-task pattern). Optional + `dep:`-gated
+# by each provider feature so a default build still pulls nothing.
+tokio = { version = "1", optional = true, features = ["rt", "sync", "macros", "net", "time"] }
+# base64 — decode/encode streamed audio chunks (Cartesia/ElevenLabs/OpenAI-Realtime/
+# Nova Sonic). Same crate flowcat-core uses for the Gemini inline-data codec.
+base64 = { version = "0.22", optional = true }
+# gRPC providers (Google STT/TTS). (Spec §3 said 0.12; latest is 0.14 — pinned to
+# the available major.)
+tonic = { version = "0.14", optional = true }
+# gRPC live transport (Google STT): the custom `tonic::codec::Codec` reads/writes
+# `EncodeBuf`/`DecodeBuf` via `bytes::{Buf,BufMut}`, and `Grpc::streaming` takes an
+# `http::uri::PathAndQuery`. Both are already in-tree via tonic; named here so the
+# stt-google connector can use them directly.
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+# Local Whisper (whisper.cpp bindings). (Spec §3 said 0.14; latest is 0.16.)
+whisper-rs = { version = "0.16", optional = true }
+# OpenTelemetry exporter. (Spec §3 said 0.27; latest is 0.32.)
+opentelemetry = { version = "0.32", optional = true }
+# AWS SigV4 request signing (Bedrock LLM / Transcribe STT / Polly TTS) — hand-rolled
+# over reqwest, NO AWS SDK. HMAC-SHA256 + SHA-256 only.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# WS-based provider live smokes (tokio-tungstenite + rustls 0.23) need a
+# process-wide CryptoProvider installed. In production the host binary installs
+# it; the smokes install it themselves. Library
+# consumers must likewise install one before opening a WS provider connection.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }

@@ -1,0 +1,23 @@
+[package]
+name = "flowcat-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "flowcat-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+bytes = "1"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Standalone: intentionally NOT a member of the Flowcat workspace; its own
+# `[workspace]` table below keeps this benchmark crate isolated.
+[workspace]

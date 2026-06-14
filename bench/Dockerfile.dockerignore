@@ -1,0 +1,11 @@
+# Build-context trim for bench/Dockerfile (BuildKit reads this per-Dockerfile ignore
+# so it does NOT touch any repo-root .dockerignore). Trims VCS / build / cache cruft
+# from the build context.
+**/.git
+**/node_modules
+**/target
+**/__pycache__
+**/.venv
+**/*.pyc
+docs
+.github

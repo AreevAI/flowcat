@@ -1,0 +1,11 @@
+# Cargo build output for this workspace — never commit it.
+/target
+
+# mdBook docs-site build output (sources live in website/; see website/README.md).
+/website/book
+
+# pipecat checkout cloned into the repo root for the benchmark (see bench/README.md).
+/pipecat
+
+# Benchmark sweep output.
+/bench/vm-results.txt

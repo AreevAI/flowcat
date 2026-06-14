@@ -1,0 +1,80 @@
+Flowcat
+Copyright (c) 2026 MindGryd Software Private Limited
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this product except in compliance with the License. A copy of
+the License is in the LICENSE file at the root of this repository, and is also
+available at http://www.apache.org/licenses/LICENSE-2.0.
+
+================================================================================
+Third-party attributions
+================================================================================
+
+pipecat (architecture & API reference)
+--------------------------------------
+Flowcat is a native-Rust runtime built to the same architecture and public API
+model as the pipecat project: the FrameProcessor / Frame taxonomy, the
+system-frame priority and interruption model, the service-processor seams
+(STT / TTS / LLM / realtime), the carrier serializer set, and the provider
+catalogue all follow pipecat's design and interface conventions. Many file-level
+doc comments cite the corresponding pipecat source locations for traceability.
+pipecat is used as an architecture and API reference; it is licensed under the
+BSD 2-Clause License, reproduced in full below.
+
+    pipecat / pipecat-ai
+    Copyright (c) 2024-2026, Daily
+    https://github.com/pipecat-ai/pipecat
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+AWS Signature Version 4 known-answer test vectors
+-------------------------------------------------
+The SigV4 request-signing implementations used by the AWS providers
+(Amazon Bedrock LLM, Amazon Transcribe STT, Amazon Polly TTS) are hand-rolled
+over `reqwest` + HMAC-SHA256 / SHA-256 — no AWS SDK is used. Their unit tests
+pin correctness against the AWS-published SigV4 known-answer test vectors
+(the "Examples of signing AWS requests with Signature Version 4" /
+GET-vanilla derivation vectors). Those vectors are published by Amazon Web
+Services in the AWS General Reference documentation.
+
+    Amazon Web Services SigV4 signing examples
+    (C) Amazon Web Services, Inc. — used as published reference test vectors.
+    https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html
+
+Provider wire protocols
+-----------------------
+Flowcat speaks the network wire protocols of third-party speech, language, and
+telephony vendors (e.g. Google Gemini Live, OpenAI / OpenAI-Realtime, Anthropic,
+Deepgram, Cartesia, ElevenLabs, AssemblyAI, Twilio / Telnyx / Plivo / Vonage and
+the other serializers, etc.). Those protocols, API schemas, service names, and
+trademarks are the property of their respective owners. Flowcat is an independent
+client implementation and is not endorsed by or affiliated with any of these
+vendors. Use of any provider requires the user's own credentials and acceptance
+of that vendor's terms.
+
+Rust crate dependencies
+-----------------------
+Flowcat depends on a number of third-party Rust crates (tokio, str0m, rsipstack,
+reqwest, tonic, rubato, ort, and others — see each crate's Cargo.toml). Each is
+distributed under its own license (predominantly MIT / Apache-2.0); those
+licenses govern the respective crates and are reproduced in their source.

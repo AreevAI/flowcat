@@ -1,0 +1,19 @@
+# Flowcat — a self-contained Cargo workspace (Apache-2.0).
+#
+# The benchmark kit (`bench-rs/`) is a standalone crate and is intentionally
+# NOT a workspace member.
+
+[workspace]
+resolver = "2"
+members = [
+    "flowcat-core",
+    "flowcat-services",   # STT/TTS/LLM/realtime providers + obs exporters
+    "flowcat-transports", # str0m WebRTC / WS / Daily / local / avatar
+    "flowcat-telephony",  # carrier serializers + DTMF
+    "flowcat-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
