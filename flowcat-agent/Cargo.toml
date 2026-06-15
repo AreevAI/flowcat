@@ -1,0 +1,30 @@
+[package]
+name = "flowcat-agent"
+description = "Declarative, graph-based conversation agent (a config-driven AgentBrain) for the Flowcat voice runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# The `AgentBrain` adapter (`DeclarativeBrain`) is on by default — running an
+# agent is the crate's purpose. Turn it off (`default-features = false`) to use
+# the pure graph engine (parse / validate / interpolate) without pulling in
+# `flowcat-core`.
+default = ["brain"]
+brain = ["dep:flowcat-core"]
+
+[dependencies]
+# Only the `brain` feature needs the runtime (for the `AgentBrain` seam +
+# `ToolDecl`/`BrainAction`); the engine + graph modules are pure logic.
+flowcat-core = { path = "../flowcat-core", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Wall-clock time builtins in prompt interpolation (`{{current_time}}`,
+# `{{greeting_phrase}}`, …) — with IANA timezone support.
+chrono = "0.4"
+chrono-tz = "0.10"
