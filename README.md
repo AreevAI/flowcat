@@ -302,6 +302,7 @@ flowcat/
 │                        #   — one cargo feature each
 ├── flowcat-transports/  # str0m WebRTC + Opus, WebSocket, Daily, LiveKit, local
 ├── flowcat-telephony/   # carrier FrameSerializers (Twilio/Telnyx/Plivo/…) + DTMF
+├── flowcat-agent/       # declarative graph agent — a config-driven AgentBrain
 ├── flowcat-cli/         # `flowcat` demo binary (DX / examples surface)
 ├── bench/               # the reproducible pipecat-vs-flowcat benchmark kit + RESULTS.md
 ├── bench-rs/            # standalone load-gen + framework micro-bench
