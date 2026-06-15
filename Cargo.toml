@@ -17,3 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/AreevAI/flowcat"
+homepage = "https://areevai.github.io/flowcat/"
+keywords = ["voice", "telephony", "sip", "webrtc", "realtime"]
+categories = ["multimedia::audio", "network-programming"]

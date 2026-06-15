@@ -4,6 +4,10 @@ description = "Self-hosted native-Rust real-time voice-agent runtime — one bin
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Feature matrix. `sip`/`recorder` are additive
 # no-op flags made explicit (the SIP UA + recorder are always compiled today;

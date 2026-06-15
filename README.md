@@ -1,6 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Flowcat
 
+[![CI](https://github.com/AreevAI/flowcat/actions/workflows/ci.yml/badge.svg)](https://github.com/AreevAI/flowcat/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-areevai.github.io-blue)](https://areevai.github.io/flowcat/)
+
 **A native-Rust runtime for real-time voice agents — built to run on your own
 infrastructure.** Flowcat carries a phone or WebRTC call through a composable
 media pipeline — transport in → VAD / turn-taking → STT · LLM · TTS (or a single
