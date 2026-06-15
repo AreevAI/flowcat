@@ -39,7 +39,7 @@ base64 = "0.22"
 # resolves cleanly for wss:// — verified to compile.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # Sample-rate conversion (8k<->16k carrier<->Gemini-in, 24k->8k Gemini-out).
-rubato = "0.16"
+rubato = "3.0"
 # G.711 mu-law / A-law encode+decode (encode_ulaw / decode_ulaw).
 audio-codec-algorithms = "0.8"
 # WAV writing for the call recorder.
