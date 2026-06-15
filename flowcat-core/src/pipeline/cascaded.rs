@@ -1691,6 +1691,16 @@ mod tests {
         fn current_node_id(&self) -> String {
             self.node_id.lock().unwrap().clone()
         }
+        fn current_node_name(&self) -> String {
+            // A display name distinct from BOTH the node id ("booking") and the
+            // transition slug ("go_to_booking"), so the transcript-marker test
+            // proves the marker uses the display name, not either of those.
+            if *self.node_id.lock().unwrap() == "booking" {
+                "Booking Node".into()
+            } else {
+                "Start Node".into()
+            }
+        }
         fn on_tool_call(&mut self, name: &str, _args: &serde_json::Value) -> BrainAction {
             self.seen_tools.lock().unwrap().push(name.to_string());
             if name == END_TOOL {
@@ -1909,6 +1919,22 @@ mod tests {
         assert!(
             fin.usage["duration_seconds"].is_number(),
             "finalize usage must carry duration_seconds"
+        );
+
+        // --- (4) the transcript transition marker uses the destination node's
+        // DISPLAY NAME, not the transition slug — so the stored/historical view
+        // matches the live rail (regression guard for the `transition_0` bug).
+        let transcript = c
+            .transcript_body
+            .as_deref()
+            .expect("transcript artifact was uploaded");
+        assert!(
+            transcript.contains("[transition: Booking Node]"),
+            "marker must carry the node display name; got: {transcript}"
+        );
+        assert!(
+            !transcript.contains("go_to_booking"),
+            "marker must NOT carry the transition slug; got: {transcript}"
         );
     }
 

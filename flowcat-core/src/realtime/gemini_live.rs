@@ -798,7 +798,36 @@ fn encode_setup(setup: &RealtimeSetup, vad: &VadConfig, resume_handle: Option<&s
         None => json!({}),
     };
 
+    // Server-side context-window compression (sliding window). The native-audio
+    // Live model keeps *audio* (not just transcripts) in context, accumulating
+    // ~25 tok/s, so without this an audio-only session hard-caps at ~15 min once
+    // the 128K input window fills. Sliding-window eviction drops the oldest turns
+    // once `triggerTokens` is exceeded, retaining `targetTokens`, which converts
+    // the cap into effectively unlimited duration.
+    //
+    // NOTE: this is pure eviction, NOT a semantic summary — early-call facts are
+    // forgotten once evicted. Pair with summarize-and-restart where they matter.
+    //
+    // Both knobs are env-tunable so they can be adjusted in a live deployment
+    // without a rebuild (defaults: trigger 64K, retain 16K).
+    let trigger_tokens = compression_u32("FLOWCAT_COMPRESSION_TRIGGER_TOKENS", 64_000);
+    let target_tokens = compression_u32("FLOWCAT_COMPRESSION_TARGET_TOKENS", 16_000);
+    setup_obj["contextWindowCompression"] = json!({
+        "slidingWindow": { "targetTokens": target_tokens },
+        "triggerTokens": trigger_tokens
+    });
+
     json!({ "setup": setup_obj })
+}
+
+/// Read a `u32` token budget from `name`, falling back to `default` when the var
+/// is unset, empty, or unparseable.
+fn compression_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Recursively reduce a JSON-Schema value to the **OpenAPI-3.0 subset Gemini's
@@ -1515,6 +1544,18 @@ mod tests {
             decl["parameters"],
             json!({ "type": "object", "properties": {} })
         );
+    }
+
+    #[test]
+    fn encode_setup_enables_context_window_compression() {
+        // Sliding-window compression must be present so audio-only sessions no
+        // longer hard-cap at ~15 min. Defaults: trigger at 64K, retain 16K.
+        // (Assumes FLOWCAT_COMPRESSION_* are unset in the test env.)
+        let v = encode_setup(&sample_setup(), &VadConfig::default(), None);
+        let cwc = &v["setup"]["contextWindowCompression"];
+        assert!(cwc.is_object(), "contextWindowCompression must be present");
+        assert_eq!(cwc["triggerTokens"], 64_000);
+        assert_eq!(cwc["slidingWindow"]["targetTokens"], 16_000);
     }
 
     #[test]

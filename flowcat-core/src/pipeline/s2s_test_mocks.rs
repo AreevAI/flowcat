@@ -297,6 +297,10 @@ pub(crate) struct Captured {
     pub(crate) finalize: Option<Finalize>,
     /// (kind-ish url, content_type, byte_len) for each PUT.
     pub(crate) uploads: Vec<(String, String, usize)>,
+    /// The uploaded transcript artifact body (UTF-8), so tests can assert its
+    /// content (e.g. the `[transition: <node name>]` marker). `None` until the
+    /// transcript artifact is PUT.
+    pub(crate) transcript_body: Option<String>,
     /// Every `tool_call` relayed to the control plane:
     /// (node_id, tool_name, arguments).
     pub(crate) tool_calls: Vec<(String, String, serde_json::Value)>,
@@ -377,11 +381,14 @@ impl SessionSource for MockSession {
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<(), FlowcatError> {
-        self.captured.lock().unwrap().uploads.push((
-            url.to_string(),
-            content_type.to_string(),
-            bytes.len(),
-        ));
+        let mut c = self.captured.lock().unwrap();
+        // The transcript artifact (kind "transcript" → upload url) — keep its body
+        // so tests can assert the rendered transcript content.
+        if url.contains("transcript") {
+            c.transcript_body = Some(String::from_utf8_lossy(&bytes).to_string());
+        }
+        c.uploads
+            .push((url.to_string(), content_type.to_string(), bytes.len()));
         Ok(())
     }
 

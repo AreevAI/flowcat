@@ -33,6 +33,15 @@ pub trait AgentBrain: Send {
     /// (`SessionSource::node_tools` / `tool_call`).
     fn current_node_id(&self) -> String;
 
+    /// The display name of the brain's current conversation node. Used to label
+    /// the transition marker written into the transcript so the stored/historical
+    /// view shows the node name (e.g. "Conversation") rather than the internal
+    /// transition slug. Defaults to [`current_node_id`](Self::current_node_id) for
+    /// brains without a separate display name.
+    fn current_node_name(&self) -> String {
+        self.current_node_id()
+    }
+
     /// Interpret a tool/function call from the model into a [`BrainAction`].
     fn on_tool_call(&mut self, name: &str, args: &Value) -> BrainAction;
 
