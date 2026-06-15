@@ -206,7 +206,7 @@ whisper-rs = { version = "0.16", optional = true }
 opentelemetry = { version = "0.32", optional = true }
 # AWS SigV4 request signing (Bedrock LLM / Transcribe STT / Polly TTS) — hand-rolled
 # over reqwest, NO AWS SDK. HMAC-SHA256 + SHA-256 only.
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
