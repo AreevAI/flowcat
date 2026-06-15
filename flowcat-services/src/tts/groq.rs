@@ -21,21 +21,22 @@ use super::openai::{AudioContainer, OpenAiTts, OpenAiTtsBuilder};
 /// never the URL.
 pub const GROQ_API_BASE: &str = "https://api.groq.com/openai/v1";
 
-/// Groq TTS — the OpenAI-TTS-HTTP client configured for Groq (WAV output, 48 kHz).
+/// Groq TTS — the OpenAI-TTS-HTTP client configured for Groq (WAV output, 24 kHz).
 pub struct GroqTts {
     inner: OpenAiTts,
 }
 
 impl GroqTts {
     /// Construct bound to `api_key` + `voice_id` (default model
-    /// `canopylabs/orpheus-v1-english`, 48 kHz WAV — the pipecat Groq defaults).
+    /// `canopylabs/orpheus-v1-english`). Groq returns a 24 kHz WAV for this model
+    /// (the WAV `fmt` chunk reports 24000); tagging it 48 kHz plays it 2x fast.
     pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
         Self {
             inner: OpenAiTtsBuilder::new(api_key, voice_id)
                 .name("groq")
                 .base_url(GROQ_API_BASE)
                 .model("canopylabs/orpheus-v1-english")
-                .sample_rate(48_000)
+                .sample_rate(24_000)
                 .container(AudioContainer::Wav)
                 .build(),
         }
@@ -69,7 +70,7 @@ mod tests {
     fn wraps_openai_client_pointed_at_groq() {
         let tts = GroqTts::new("k", "autumn");
         assert_eq!(tts.name(), "groq");
-        assert_eq!(tts.sample_rate(), 48_000);
+        assert_eq!(tts.sample_rate(), 24_000);
         assert_eq!(
             tts.inner.url(),
             "https://api.groq.com/openai/v1/audio/speech"
