@@ -1,0 +1,25 @@
+[package]
+name = "flowcat-server"
+description = "Config-driven single-agent server for the Flowcat voice runtime — run an agent from a YAML/JSON config with no control plane."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
+# `default-features = false` → only the provider-factory types (ProviderSpec); the
+# server's Cargo features (added with the binary) forward to flowcat-services.
+flowcat-services = { path = "../flowcat-services", version = "0.1.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

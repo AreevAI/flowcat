@@ -11,6 +11,7 @@ members = [
     "flowcat-transports", # str0m WebRTC / WS / Daily / local / avatar
     "flowcat-telephony",  # carrier serializers + DTMF
     "flowcat-agent",      # declarative graph agent (config-driven AgentBrain)
+    "flowcat-server",     # config-driven single-agent server (config + StaticSession)
     "flowcat-cli",
 ]
 
