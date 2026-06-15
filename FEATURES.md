@@ -128,6 +128,19 @@ Serializers are dependency-free flags (pure framing).
 | `twilio`, `telnyx`, `exotel`, `vonage`, `genesys`, `asterisk`, `cloudonix`, `vobiz` | — |
 | `dtmf-inband` | — (in-band Goertzel DTMF; RFC2833 is always available) |
 
+## `flowcat-agent` — `default = ["brain"]`
+
+A declarative, graph-based agent: define an agent as a node/edge `graph_spec`
+(JSON/YAML) instead of hand-writing an `AgentBrain`. `DeclarativeBrain` is a
+ready-to-use `flowcat_core::AgentBrain` over the graph engine.
+
+| Feature | Pulls |
+| --- | --- |
+| `brain` | `flowcat-core` — the `DeclarativeBrain` `AgentBrain` adapter (default on) |
+
+With `default-features = false` the pure graph engine (parse / validate /
+`{{var}}` interpolation) builds with no `flowcat-core` dependency.
+
 ---
 
 ## Toolchain caveats

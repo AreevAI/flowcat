@@ -19,6 +19,9 @@ file): [`CONTRIBUTING.md`](CONTRIBUTING.md), [`PROCESSOR-DESIGN.md`](PROCESSOR-D
   MCP, one Cargo feature each.
 - `flowcat-transports/` — WebRTC (`str0m`) / WebSocket / Daily / LiveKit / local.
 - `flowcat-telephony/` — carrier serializers (Twilio/Telnyx/Plivo/…) + DTMF.
+- `flowcat-agent/` — declarative graph agent: a config-driven `AgentBrain`
+  (`DeclarativeBrain`) over a node/edge graph spec; default-on `brain` feature,
+  or pure engine with `default-features = false`.
 - `flowcat-cli/` — the `flowcat` demo binary.
 - `bench/`, `bench-rs/` — the reproducible pipecat-vs-flowcat benchmark kit.
 
