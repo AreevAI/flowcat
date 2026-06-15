@@ -280,3 +280,74 @@ mod tests {
         assert_eq!(PlivoSerializer::new(8000).carrier_rate(), 8000);
     }
 }
+
+// ── Plivo call-answer XML ──────────────────────────────────────────────────────
+
+/// Minimal XML escaper for the value embedded in the answer XML (a URL): `&`,
+/// `<`, `>`. The raw `&` separating query params would otherwise start an XML
+/// entity and Plivo rejects the document ("Invalid Answer XML").
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Map an `http(s)://` public base to the matching `ws(s)://` scheme.
+fn ws_scheme(public_base: &str) -> String {
+    public_base
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+}
+
+/// Build the Plivo answer XML for a run: a bidirectional μ-law/8 kHz `<Stream>`
+/// pointing back at this host's media WebSocket
+/// (`/telephony/ws/plivo/{run_id}?token=`), carrying the per-call `token`.
+///
+/// `public_base` is this host's public URL (e.g. `https://voice.example.com`);
+/// the trailing slash is trimmed and the scheme is mapped to `ws(s)://`.
+///
+/// `keepCallAlive="true"` is required: Plivo's `<Stream>` verb is non-blocking, so
+/// without it Plivo hits "End Of XML Instructions" and hangs the call up at ~1s,
+/// before a single word. The trailing `<Hangup/>` runs when the agent ends the
+/// call and the media WS closes, hanging the leg up cleanly instead of leaving it
+/// connected and silent.
+pub fn plivo_answer_xml(run_id: i64, token: &str, public_base: &str) -> String {
+    let base = public_base.trim_end_matches('/');
+    let wss_base = ws_scheme(base);
+    let ws_url = format!("{wss_base}/telephony/ws/plivo/{run_id}?token={token}");
+    let ws_url_xml = xml_escape(&ws_url);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Response><Stream contentType="audio/x-mulaw;rate=8000" bidirectional="true" keepCallAlive="true">{ws_url_xml}</Stream><Hangup/></Response>"#
+    )
+}
+
+#[cfg(test)]
+mod answer_xml_tests {
+    use super::plivo_answer_xml;
+
+    #[test]
+    fn https_base_becomes_wss_and_query_amp_is_escaped() {
+        let xml = plivo_answer_xml(42, "tok-abc", "https://voice.example.com/");
+        assert!(
+            xml.contains("wss://voice.example.com/telephony/ws/plivo/42?token=tok-abc"),
+            "ws url wrong: {xml}"
+        );
+        // Bidirectional μ-law stream with keepCallAlive="true" + a trailing <Hangup/>.
+        assert!(xml.contains(
+            r#"<Stream contentType="audio/x-mulaw;rate=8000" bidirectional="true" keepCallAlive="true">"#
+        ));
+        assert!(
+            xml.contains("</Stream><Hangup/></Response>"),
+            "trailing <Hangup/> must run on WS close: {xml}"
+        );
+        // A `&` in the base (multi-param query) must be escaped or Plivo rejects it.
+        let xml2 = plivo_answer_xml(7, "t", "https://h.example/a?x=1&y=2");
+        assert!(xml2.contains("&amp;"), "ampersand must be escaped: {xml2}");
+    }
+
+    #[test]
+    fn http_base_becomes_ws() {
+        let xml = plivo_answer_xml(1, "tok", "http://localhost:6210");
+        assert!(xml.contains("ws://localhost:6210/telephony/ws/plivo/1?token=tok"));
+    }
+}

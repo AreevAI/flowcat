@@ -67,7 +67,7 @@ pub use twilio::TwilioSerializer;
 pub use telnyx::{Encoding as TelnyxEncoding, TelnyxSerializer};
 
 #[cfg(feature = "plivo")]
-pub use plivo::PlivoSerializer;
+pub use plivo::{plivo_answer_xml, PlivoSerializer};
 
 #[cfg(feature = "exotel")]
 pub use exotel::ExotelSerializer;
