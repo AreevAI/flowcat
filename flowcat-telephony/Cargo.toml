@@ -4,6 +4,10 @@ description = "Flowcat carrier WebSocket FrameSerializers (Twilio/Telnyx/Plivo/E
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Each carrier serializer is behind its
 # own feature (no extra dep — they only need base64+serde_json, already on). The
@@ -24,7 +28,7 @@ vobiz = []
 dtmf-inband = []   # in-band Goertzel DTMF detection (RFC2833 is always available)
 
 [dependencies]
-flowcat-core = { path = "../flowcat-core" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

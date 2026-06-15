@@ -4,6 +4,10 @@ description = "Flowcat media transports: str0m WebRTC + Opus, WebSocket, Daily/L
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Every transport SDK is `optional` +
 # reached only via a `dep:`-gated feature, so a default build compiles nothing
@@ -25,7 +29,7 @@ livekit      = []
 local        = ["dep:audiopus", "dep:tokio"]
 
 [dependencies]
-flowcat-core = { path = "../flowcat-core" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

@@ -4,15 +4,19 @@ description = "Flowcat developer CLI — local-mic / WebSocket demo harness."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "flowcat"
 path = "src/main.rs"
 
 [dependencies]
-flowcat-core = { path = "../flowcat-core" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
 # The generic WebSocket media transport (`WsTransport`) used by the `ws-echo` demo.
-flowcat-transports = { path = "../flowcat-transports", features = ["ws"] }
+flowcat-transports = { path = "../flowcat-transports", version = "0.1.0", features = ["ws"] }
 # `#[async_trait]` for the demo `FrameProcessor`/`FrameObserver` impls (same
 # version flowcat-core/-transports use).
 async-trait = "0.1"

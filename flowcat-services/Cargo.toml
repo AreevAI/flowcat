@@ -4,6 +4,10 @@ description = "Flowcat speech/LLM service providers: realtime S2S (Gemini siblin
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # EVERY provider dep is declared
 # `optional` and reached only via a `dep:`-gated feature, so a default build
@@ -168,7 +172,7 @@ obs-all      = ["obs-otel", "obs-sentry", "obs-langfuse"]
 
 [dependencies]
 # Always on: the frozen service traits + Frame enum the impls build against.
-flowcat-core = { path = "../flowcat-core" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
