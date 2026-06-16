@@ -205,6 +205,11 @@ pub fn stt(spec: &ProviderSpec) -> Result<Box<dyn SttService>, FlowcatError> {
         #[cfg(feature = "stt-google")]
         "google" => {
             let project = spec.opt("project");
+            if project.is_empty() {
+                return Err(FlowcatError::Session(
+                    "google stt requires the `project` option (your GCP project id)".to_string(),
+                ));
+            }
             let location = {
                 let l = spec.opt("location");
                 if l.is_empty() {
@@ -471,7 +476,17 @@ pub fn realtime(spec: &ProviderSpec) -> Result<Box<dyn RealtimeBackend>, Flowcat
         }
     };
     match spec.provider.to_ascii_lowercase().as_str() {
-        "gemini" | "google" | "google_realtime" => Ok(Box::new(GeminiLive::new(key.to_string()))),
+        "gemini" | "google" | "google_realtime" => {
+            // Validate upfront (like the feature-gated realtime providers below) so a
+            // missing key is a clean error here, not a cryptic failure at connect time.
+            if key.trim().is_empty() {
+                return Err(FlowcatError::Realtime(
+                    "gemini realtime selected but no API key configured (set GOOGLE_API_KEY)"
+                        .to_string(),
+                ));
+            }
+            Ok(Box::new(GeminiLive::new(key.to_string())))
+        }
         #[cfg(feature = "realtime-openai")]
         "openai" | "openai_realtime" => {
             let key = require_realtime_key("openai", spec)?;
@@ -523,7 +538,7 @@ pub fn realtime(spec: &ProviderSpec) -> Result<Box<dyn RealtimeBackend>, Flowcat
             )))
         }
         "google_vertex" | "google_vertex_realtime" | "vertex_realtime" => {
-            if key.is_empty() {
+            if key.trim().is_empty() {
                 return Err(FlowcatError::Realtime(
                     "google_vertex realtime selected but no access token configured \
                      (set api_key to an OAuth2 access token)"
@@ -607,15 +622,36 @@ mod tests {
     }
 
     #[test]
-    fn realtime_gemini_always_builds_and_unknown_is_not_built() {
+    fn realtime_gemini_is_key_gated_and_unknown_is_not_built() {
+        // With a key, gemini builds.
         assert!(realtime(&spec("gemini", "k")).is_ok());
         assert!(realtime(&spec("GEMINI", "k")).is_ok());
+        // Without a key it is a clean error (not a cryptic connect-time failure).
+        let err = match realtime(&ProviderSpec::new("gemini")) {
+            Ok(_) => panic!("gemini realtime with no key should error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no API key configured"), "got: {err}");
+        // An unknown provider is a clean "not built" error naming the provider.
         let err = match realtime(&spec("banana", "k")) {
             Ok(_) => panic!("unknown realtime should not be built"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("not built"), "got: {err}");
         assert!(err.contains("banana"), "got: {err}");
+    }
+
+    #[cfg(feature = "stt-google")]
+    #[test]
+    fn google_stt_requires_a_project_option() {
+        // No `project` → a clean config error, not a malformed recognizer path.
+        let err = match stt(&spec("google", "token")) {
+            Ok(_) => panic!("google stt with no project should error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("project"), "got: {err}");
+        // With a project it builds.
+        assert!(stt(&spec("google", "token").with_option("project", "my-proj")).is_ok());
     }
 
     // ── feature-gated provider coverage (run under the connector feature set) ──
