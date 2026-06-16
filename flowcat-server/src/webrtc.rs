@@ -9,7 +9,7 @@
 //! credentials in the page — the server runs the single configured agent and the
 //! browser is just a mic + speaker + transcript view.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -21,11 +21,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use flowcat_core::observer::{FrameObserver, RtviObserver, RtviSink};
-use flowcat_core::{AgentBrain, SessionSource};
+use flowcat_core::{AgentBrain, FlowcatError, SessionSource};
 use flowcat_transports::WebRtcTransport;
 
+use crate::config::TopologyConfig;
 use crate::events::RtfSink;
-use crate::run;
+use crate::run::{self, SpecResolver};
 use crate::server::{resolve_brain, AppState};
 
 /// str0m carrier rate — matches the realtime input rate (the S2S processors
@@ -57,6 +58,95 @@ pub async fn playground_page() -> Html<&'static str> {
     Html(PLAYGROUND_HTML)
 }
 
+/// Inputs for [`handle_offer`], grouped so the helper stays under the
+/// argument-count lint. Generic over the brain `B`, session `S`, and a `keepalive`
+/// value `G` the spawned call owns for its lifetime.
+pub struct OfferParams<B, S, G> {
+    /// The browser's SDP offer (post-ICE-gathering, so it carries candidates).
+    pub sdp: String,
+    /// Concrete IPv4 the media socket binds (str0m advertises it as the host ICE
+    /// candidate and rejects 0.0.0.0); the caller chooses the interface — security.
+    pub bind_ip: Ipv4Addr,
+    /// Pipeline-facing carrier sample rate the str0m transport resamples to.
+    pub carrier_rate: u32,
+    /// Which providers to run + how their specs (keys) resolve.
+    pub topology: TopologyConfig,
+    /// Resolves each provider leg's spec (see [`SpecResolver`]).
+    pub resolver: SpecResolver,
+    /// The conversation brain for this call.
+    pub brain: B,
+    /// The session bootstrap/finalize source.
+    pub session: S,
+    /// Run id passed to the pipeline.
+    pub run_id: i64,
+    /// Per-call token passed to the pipeline (empty for the playground).
+    pub token: String,
+    /// Pipeline observers (e.g. an `RtviObserver` bridging live events).
+    pub observers: Vec<Arc<dyn FrameObserver>>,
+    /// A value held by the spawned call and dropped when it ends (e.g. an events
+    /// channel drop-guard). Pass `()` if there is nothing to hold.
+    pub keepalive: G,
+}
+
+/// Accept a browser SDP **offer**, bind a media socket, build the str0m transport,
+/// spawn the call detached, and return the **SDP answer** to send back.
+///
+/// This is the reusable "browser offer → audio session" signaling primitive: it
+/// owns the offer/answer, the UDP bind, the str0m transport, and the call spawn —
+/// but NOT the HTTP request/response shapes or auth (the caller frames those).
+/// flowcat-server's own [`offer`] is a thin wrapper over it; an external server
+/// calls it the same way with its own session + brain.
+///
+/// Errors before the spawn surface to the caller: a bind failure is
+/// [`FlowcatError::Io`]; a malformed/unacceptable offer is [`FlowcatError::Protocol`]
+/// (or another transport error). The call itself runs detached — once the answer is
+/// returned, a call-time failure is logged, not returned.
+pub async fn handle_offer<B, S, G>(params: OfferParams<B, S, G>) -> Result<String, FlowcatError>
+where
+    B: AgentBrain + 'static,
+    S: SessionSource + 'static,
+    G: Send + 'static,
+{
+    let OfferParams {
+        sdp,
+        bind_ip,
+        carrier_rate,
+        topology,
+        resolver,
+        brain,
+        session,
+        run_id,
+        token,
+        observers,
+        keepalive,
+    } = params;
+
+    // Bind the media socket on the chosen interface (str0m advertises it as the
+    // host ICE candidate and rejects 0.0.0.0). An io error here is the caller's 5xx.
+    let bind = SocketAddr::new(IpAddr::V4(bind_ip), 0);
+    let socket = tokio::net::UdpSocket::bind(bind).await?;
+
+    // Accept the offer → the str0m transport + the SDP answer. A bad offer is an Err
+    // with no peer created.
+    let (transport, answer) = WebRtcTransport::accept_offer(&sdp, socket, carrier_rate)?;
+
+    // Run the call detached; the answer goes back to the browser now.
+    info!(run_id, "webrtc offer accepted; running call detached");
+    tokio::spawn(async move {
+        let _keepalive = keepalive; // held until call end (e.g. deregisters events)
+        let res = run::run_call_with(
+            transport, &topology, &*resolver, brain, session, run_id, token, observers,
+        )
+        .await;
+        match res {
+            Ok(()) => info!(run_id, "webrtc call ended cleanly"),
+            Err(e) => error!(run_id, error = %e, "webrtc call ended with error"),
+        }
+    });
+
+    Ok(answer)
+}
+
 /// `POST /webrtc/offer` — accept the browser SDP offer and run the configured agent.
 ///
 /// Generic over the embedder's session/brain: the call is resolved through the
@@ -82,60 +172,46 @@ where
         Err(r) => return r,
     };
 
-    // Bind a UDP socket for the WebRTC media on the configured interface (str0m
-    // advertises this as the host ICE candidate and rejects 0.0.0.0).
-    let bind = SocketAddr::new(IpAddr::V4(state.webrtc_bind_ip), 0);
-    let socket = match tokio::net::UdpSocket::bind(bind).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "webrtc offer: failed to bind UDP socket");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to bind a media socket",
-            )
-                .into_response();
-        }
-    };
-
-    // Accept the browser offer → the str0m transport + the SDP answer.
-    let (transport, answer) =
-        match WebRtcTransport::accept_offer(&body.sdp, socket, WEBRTC_CARRIER_RATE) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(error = %e, "webrtc offer: accept_offer failed");
-                return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
-            }
-        };
-
     // Register the live-event channel BEFORE returning the answer so opening
-    // markers aren't lost to a subscribe race.
+    // markers aren't lost to a subscribe race; the guard rides the call as its
+    // `keepalive` and deregisters the channel on call end.
     let (call_events, guard) = state.events.register(&pc_id);
     let sink: Arc<dyn RtviSink> = Arc::new(RtfSink::new(call_events));
     let observers: Vec<Arc<dyn FrameObserver>> = vec![Arc::new(RtviObserver::new(sink))];
 
-    let session = Arc::clone(&state.session);
-    let topology = Arc::clone(&state.topology);
-    info!(pc_id = %pc_id, "webrtc offer accepted; running call detached");
-    let call_pc = pc_id.clone();
-    tokio::spawn(async move {
-        let _guard = guard; // deregister the live-event channel on call end
-        let res = run::run_call(
-            transport,
-            &topology,
-            brain,
-            session,
-            run_id,
-            String::new(),
-            observers,
-        )
-        .await;
-        match res {
-            Ok(()) => info!(pc_id = %call_pc, "webrtc call ended cleanly"),
-            Err(e) => error!(pc_id = %call_pc, error = %e, "webrtc call ended with error"),
-        }
-    });
+    // The reusable signaling primitive owns the offer/answer + bind + transport +
+    // spawn; this handler only frames the HTTP request/response (and the events WS).
+    let answer = handle_offer(OfferParams {
+        sdp: body.sdp,
+        bind_ip: state.webrtc_bind_ip,
+        carrier_rate: WEBRTC_CARRIER_RATE,
+        topology: (*state.topology).clone(),
+        resolver: Arc::clone(&state.spec_resolver),
+        brain,
+        session: Arc::clone(&state.session),
+        run_id,
+        token: String::new(),
+        observers,
+        keepalive: guard,
+    })
+    .await;
 
-    Json(OfferResponse { sdp: answer, pc_id }).into_response()
+    match answer {
+        Ok(sdp) => Json(OfferResponse { sdp, pc_id }).into_response(),
+        // A bind failure is a server error; a bad/unacceptable offer is the client's.
+        Err(e @ FlowcatError::Io(_)) => {
+            error!(pc_id = %pc_id, error = %e, "webrtc offer: failed to bind media socket");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to bind a media socket",
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(pc_id = %pc_id, error = %e, "webrtc offer: rejected");
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +270,100 @@ mod tests {
             .await
             .unwrap();
         // A graph this small is valid, so we get past the brain build; the junk SDP
-        // fails str0m's accept_offer → 422 (client error), no peer created.
+        // fails str0m's accept_offer → 422 (client error), no peer created. (The
+        // handler now delegates to `handle_offer`, which surfaces the Protocol error
+        // it maps to 422.)
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- The reusable signaling helper, called directly (the external-server path). ---
+
+    /// A realistic (minimal) browser-style SDP offer negotiating Opus, with the ICE
+    /// + DTLS lines a real offer carries — close enough for str0m to accept it.
+    fn sample_browser_offer() -> String {
+        "v=0\r\n\
+         o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+         s=-\r\n\
+         t=0 0\r\n\
+         a=group:BUNDLE 0\r\n\
+         a=msid-semantic: WMS\r\n\
+         m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+         c=IN IP4 127.0.0.1\r\n\
+         a=rtcp:9 IN IP4 0.0.0.0\r\n\
+         a=ice-ufrag:F7gI\r\n\
+         a=ice-pwd:x9cml/YzichV2+XlhiMu8g\r\n\
+         a=ice-options:trickle\r\n\
+         a=fingerprint:sha-256 \
+         AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89\r\n\
+         a=setup:actpass\r\n\
+         a=mid:0\r\n\
+         a=sendrecv\r\n\
+         a=rtcp-mux\r\n\
+         a=rtpmap:111 opus/48000/2\r\n\
+         a=fmtp:111 minptime=10;useinbandfec=1\r\n"
+            .to_string()
+    }
+
+    /// Build the brain + session an external caller would hand the helper. The call
+    /// it spawns will fail to connect (no provider key) — fine, that's detached; the
+    /// signaling test only asserts on the returned SDP answer.
+    fn offer_params(sdp: String) -> OfferParams<DeclarativeBrain, StaticSession, ()> {
+        let graph = serde_json::json!({
+            "nodes": [{ "id": "s", "type": "startCall", "data": { "prompt": "hi" } }],
+            "edges": []
+        });
+        let brain =
+            DeclarativeBrain::new(&graph, serde_json::json!({}), Default::default()).unwrap();
+        let session = StaticSession::new(graph, Default::default(), "test");
+        OfferParams {
+            sdp,
+            bind_ip: std::net::Ipv4Addr::LOCALHOST,
+            carrier_rate: WEBRTC_CARRIER_RATE,
+            topology: TopologyConfig::Realtime {
+                provider: "gemini".into(),
+                model: String::new(),
+                options: Default::default(),
+            },
+            resolver: Arc::new(run::env_spec_resolver),
+            brain,
+            session,
+            run_id: 1,
+            token: String::new(),
+            observers: vec![],
+            keepalive: (),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_offer_accepts_a_browser_offer_and_returns_an_answer() {
+        // The external-server path: build the helper's inputs ourselves (no AppState)
+        // and get a valid SDP answer back — a working str0m audio session at the
+        // signaling boundary.
+        let answer = handle_offer(offer_params(sample_browser_offer()))
+            .await
+            .expect("a valid offer yields an answer");
+        assert!(answer.starts_with("v=0"), "answer is SDP: {answer}");
+        assert!(answer.contains("m=audio"), "answer has the audio m-line");
+        assert!(
+            answer.to_ascii_lowercase().contains("opus"),
+            "answer negotiates opus: {answer}"
+        );
+        assert!(
+            answer.contains("a=fingerprint:"),
+            "answer carries the DTLS-SRTP fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_offer_rejects_a_malformed_offer() {
+        // Same helper, bad SDP → a clean Protocol error (no panic, no peer), which
+        // the HTTP wrapper maps to 422.
+        let err = handle_offer(offer_params("not-a-valid-sdp".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FlowcatError::Protocol(_)),
+            "malformed offer is a protocol error, got: {err:?}"
+        );
     }
 }
