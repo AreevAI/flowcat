@@ -89,7 +89,9 @@ pub fn env_spec_resolver(spec: &ProviderSpec) -> Result<ProviderSpec, FlowcatErr
 
 /// The provider specs a call runs with, after resolution — what the factory builds
 /// from. Realtime is a single spec; cascaded is the STT/LLM/TTS trio.
-#[derive(Debug)]
+///
+/// Deliberately not `Debug`: the specs carry resolved `api_key`s, so there is no
+/// derive to accidentally log a secret through.
 enum ResolvedProviders {
     Realtime(ProviderSpec),
     Cascaded {
@@ -337,14 +339,19 @@ mod tests {
             tts: cfg_spec("cartesia", "voice-xyz"),
         };
         // A resolver that fails for one leg (e.g. a missing secret) aborts cleanly.
-        let err = resolve_providers(&topology, |spec: &ProviderSpec| {
+        // (Matched out rather than `unwrap_err`'d so `ResolvedProviders` need not be
+        // `Debug` — it carries resolved api keys.)
+        let result = resolve_providers(&topology, |spec: &ProviderSpec| {
             if spec.provider == "openai" {
                 Err(FlowcatError::Other("no secret for openai".into()))
             } else {
                 Ok(spec.clone())
             }
-        })
-        .unwrap_err();
+        });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected the resolver error to propagate"),
+        };
         assert!(err.to_string().contains("no secret for openai"));
     }
 }
