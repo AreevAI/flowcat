@@ -67,15 +67,26 @@ pub fn pcm_audio_frame(bytes: &[u8], rate: u32, context_id: &Arc<str>) -> Option
     })
 }
 
-/// Frame a one-shot synthesis (`TtsStarted` → [one `TtsAudio`] → `TtsStopped`).
+/// Frame a one-shot synthesis (`TtsStarted` → [`TtsAudio`…] → `TtsStopped`).
 /// The single helper every HTTP/local provider's `run_tts` funnels through, so the
 /// framing is identical across the tail.
+///
+/// The whole-utterance PCM is split into ~20 ms `TtsAudio` frames, like the
+/// streaming providers and `http_tts_common::tts_frames` do. The transport paces
+/// realtime audio in small frames; a single giant frame for the whole utterance is
+/// mishandled (only its tail plays).
 pub fn one_shot_frames(pcm_bytes: &[u8], rate: u32, context_id: Arc<str>) -> Vec<Frame> {
-    let mut out = vec![Frame::TtsStarted {
+    let pcm = pcm_s16le(pcm_bytes);
+    let chunk = (rate as usize / 50).max(1); // ~20 ms at `rate`
+    let mut out = Vec::with_capacity(pcm.len() / chunk + 2);
+    out.push(Frame::TtsStarted {
         context_id: Some(context_id.clone()),
-    }];
-    if let Some(audio) = pcm_audio_frame(pcm_bytes, rate, &context_id) {
-        out.push(audio);
+    });
+    for samples in pcm.chunks(chunk) {
+        out.push(Frame::TtsAudio {
+            audio: Arc::new(AudioFrame::mono(samples.to_vec(), rate)),
+            context_id: Some(context_id.clone()),
+        });
     }
     out.push(Frame::TtsStopped {
         context_id: Some(context_id),
@@ -249,6 +260,30 @@ mod tail_common_tests {
         let ctx: Arc<str> = Arc::from("ctx-1");
         let frames = one_shot_frames(&[], 24_000, ctx);
         assert_eq!(frames.len(), 2); // started + stopped, no audio
+    }
+
+    #[test]
+    fn one_shot_frames_chunks_into_20ms_frames() {
+        let ctx: Arc<str> = Arc::from("ctx-1");
+        // 1 s of audio at 24 kHz = 24000 samples → 50 chunks of ≤480 samples
+        // (~20 ms each), bracketed by Started/Stopped.
+        let samples: Vec<i16> = (0..24_000).map(|i| (i % 1000) as i16).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let frames = one_shot_frames(&bytes, 24_000, ctx);
+        assert!(matches!(frames[0], Frame::TtsStarted { .. }));
+        assert!(matches!(frames[frames.len() - 1], Frame::TtsStopped { .. }));
+        let audio: Vec<&_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::TtsAudio { audio, .. } => Some(audio),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(audio.len(), 50, "1 s at 24 kHz should be 50 ~20 ms frames");
+        assert!(audio.iter().all(|a| a.pcm.len() <= 480));
+        // Reassembling the chunks reproduces the original PCM exactly.
+        let rejoined: Vec<i16> = audio.iter().flat_map(|a| a.pcm.clone()).collect();
+        assert_eq!(rejoined, samples);
     }
 
     #[test]
