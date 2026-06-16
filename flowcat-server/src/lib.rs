@@ -47,3 +47,6 @@ pub use session::StaticSession;
 
 #[cfg(feature = "server")]
 pub use server::{build_router, AppState, BrainFactory};
+
+#[cfg(feature = "webrtc")]
+pub use webrtc::{handle_offer, OfferParams};
