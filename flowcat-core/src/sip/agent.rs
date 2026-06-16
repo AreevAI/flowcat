@@ -472,14 +472,28 @@ impl SipAgent {
         ))
     }
 
-    /// Tear down the agent: cancels the endpoint serve loop + all tasks.
-    pub fn shutdown(&self) {
+    /// Gracefully tear down the agent: politely de-register the trunk
+    /// ([`SipAgent::unregister`] — best-effort and time-bounded) and then cancel
+    /// the endpoint serve loop + all background tasks.
+    ///
+    /// Prefer this over just dropping the agent: `Drop` is a hard stop that cancels
+    /// everything immediately and — being synchronous — cannot send the
+    /// `Expires: 0` de-REGISTER, so the registrar would hold a stale binding until
+    /// it expires. A de-REGISTER failure here is logged, not fatal; teardown
+    /// proceeds regardless.
+    pub async fn shutdown(&self) {
+        if let Err(e) = self.unregister().await {
+            tracing::warn!(error = %e, "SIP de-REGISTER on shutdown failed; tearing down anyway");
+        }
         self.cancel.cancel();
     }
 }
 
 impl Drop for SipAgent {
     fn drop(&mut self) {
+        // Hard stop / safety net: cancel the endpoint + all tasks. Drop is sync, so
+        // it cannot de-REGISTER — call `shutdown().await` for a graceful stop that
+        // releases the trunk binding first.
         self.cancel.cancel();
     }
 }
@@ -1035,5 +1049,177 @@ mod tests {
             "RTP port {p} is odd despite odd base (RFC 3550 wants even)"
         );
         drop(s);
+    }
+
+    // ── Loopback signaling integration: two in-process `SipAgent`s call each
+    //    other over 127.0.0.1, exercising the dialog lifecycle end to end (setup,
+    //    agent-initiated BYE, reject) and asserting dialogs don't leak from the
+    //    `DialogLayer` map. Like the `transport.rs` tests these open real loopback
+    //    UDP sockets, but they are fully hermetic: no registrar, no credentials,
+    //    no external host. ─────────────────────────────────────────────────────
+    use crate::transport::media::{MediaIn, MediaTransport};
+
+    /// Grab a currently-free UDP port on loopback. The probe socket is released
+    /// immediately and rebound by the agent — fine for an in-process test.
+    async fn free_udp_port() -> u16 {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p = s.local_addr().unwrap().port();
+        drop(s);
+        p
+    }
+
+    /// Start a credential-less loopback agent on `sip_port`, advertising 127.0.0.1.
+    /// `server` is only consulted when the agent originates a call.
+    async fn start_loopback_agent(server: String, sip_port: u16) -> SipAgent {
+        let cfg = SipConfig {
+            server,
+            login: String::new(),
+            // Empty password → no REGISTER loop, so no registrar is needed.
+            password: String::new(),
+            caller_id: "1000".to_string(),
+            // Force the SDP/Contact/Via address to loopback so media + signaling
+            // both resolve to 127.0.0.1 regardless of the host's interfaces.
+            public_ip: Some(Ipv4Addr::LOCALHOST),
+            sip_port: Some(sip_port),
+            rtp_port_base: 40000,
+            rtp_port_tries: 200,
+        };
+        SipAgent::start(cfg).await.expect("agent start")
+    }
+
+    /// Poll `cond` every 20 ms for up to ~5 s; returns whether it became true.
+    async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+        for _ in 0..250 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cond()
+    }
+
+    /// Stand up a caller→callee pair on loopback. Returns both agents and both
+    /// media transports once the call is answered and confirmed.
+    async fn establish_loopback_call() -> (SipAgent, SipAgent, SipTransport, SipTransport) {
+        let port_b = free_udp_port().await;
+        let callee = start_loopback_agent("sip:127.0.0.1:1".to_string(), port_b).await;
+        let port_a = free_udp_port().await;
+        let caller = start_loopback_agent(format!("sip:127.0.0.1:{port_b}"), port_a).await;
+
+        // Answer on the callee side concurrently with the caller's originate.
+        let answer = tokio::spawn(async move {
+            let invite = tokio::time::timeout(Duration::from_secs(5), callee.next_inbound())
+                .await
+                .expect("inbound INVITE timed out")
+                .expect("callee shut down before INVITE");
+            // Identity comes from the SIP To user (the dialed number), not the body.
+            assert_eq!(invite.to_did, "2000");
+            let transport = invite.answer().await.expect("answer failed");
+            (callee, transport)
+        });
+
+        let caller_tr =
+            tokio::time::timeout(Duration::from_secs(5), caller.originate("2000", None))
+                .await
+                .expect("originate timed out")
+                .expect("outbound call not answered");
+        let (callee, callee_tr) = answer.await.expect("answer task panicked");
+        (caller, callee, caller_tr, callee_tr)
+    }
+
+    /// Drain `recv` past `StreamStart` and any (comfort-silence) audio until the
+    /// leg ends, asserting the terminal event is `Stop`.
+    async fn recv_until_stop(tr: &mut SipTransport) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), tr.recv())
+                .await
+                .expect("recv timed out waiting for Stop")
+            {
+                Some(MediaIn::StreamStart { .. }) | Some(MediaIn::Audio(_)) => continue,
+                other => {
+                    assert_eq!(other, Some(MediaIn::Stop), "expected Stop at end of leg");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A full call sets up one dialog per leg; the agent ending the call (dropping
+    /// its transport) must BYE the peer (→ the peer's leg sees `Stop`) and both
+    /// dialogs must be removed from their layers (the leak fix, #1/#2/#3).
+    #[tokio::test]
+    async fn loopback_agent_hangup_byes_peer_and_removes_both_dialogs() {
+        let (caller, callee, caller_tr, mut callee_tr) = establish_loopback_call().await;
+
+        // Both legs established → exactly one dialog in each layer.
+        assert!(
+            wait_until(|| caller.dialog_layer.len() == 1).await,
+            "caller dialog missing after answer"
+        );
+        assert!(
+            wait_until(|| callee.dialog_layer.len() == 1).await,
+            "callee dialog missing after answer"
+        );
+
+        // Agent-initiated hangup: the caller ends the call by dropping its
+        // transport. Its supervisor must send a BYE to the callee.
+        drop(caller_tr);
+
+        // The callee's leg sees the BYE as end-of-media (Stop)…
+        recv_until_stop(&mut callee_tr).await;
+        // …and both dialogs are released from their layers (no leak).
+        assert!(
+            wait_until(|| caller.dialog_layer.is_empty()).await,
+            "caller dialog leaked after hangup"
+        );
+        assert!(
+            wait_until(|| callee.dialog_layer.is_empty()).await,
+            "callee dialog leaked after BYE"
+        );
+
+        caller.shutdown().await;
+        callee.shutdown().await;
+    }
+
+    /// Rejecting an inbound INVITE returns an error to the caller (no transport)
+    /// and removes the server dialog the pump created (the reject leak fix).
+    #[tokio::test]
+    async fn loopback_rejected_call_errors_and_removes_dialog() {
+        let port_b = free_udp_port().await;
+        let callee = start_loopback_agent("sip:127.0.0.1:1".to_string(), port_b).await;
+        let port_a = free_udp_port().await;
+        let caller = start_loopback_agent(format!("sip:127.0.0.1:{port_b}"), port_a).await;
+
+        let reject = tokio::spawn(async move {
+            let invite = tokio::time::timeout(Duration::from_secs(5), callee.next_inbound())
+                .await
+                .expect("inbound INVITE timed out")
+                .expect("callee shut down before INVITE");
+            invite.reject(None); // 486 Busy Here
+            callee
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(5), caller.originate("2000", None))
+            .await
+            .expect("originate timed out");
+        assert!(
+            res.is_err(),
+            "a rejected call must not yield a media transport"
+        );
+
+        let callee = reject.await.expect("reject task panicked");
+        // The rejected server dialog must be gone (no leak); the caller's
+        // unconfirmed client dialog is dropped by do_invite on the non-2xx too.
+        assert!(
+            wait_until(|| callee.dialog_layer.is_empty()).await,
+            "callee dialog leaked after reject"
+        );
+        assert!(
+            wait_until(|| caller.dialog_layer.is_empty()).await,
+            "caller dialog leaked after reject"
+        );
+
+        caller.shutdown().await;
+        callee.shutdown().await;
     }
 }
