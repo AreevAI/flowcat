@@ -42,6 +42,7 @@ pub mod events;
 pub mod webrtc;
 
 pub use config::{ConfigError, ServerConfig, TopologyConfig};
+pub use run::{env_spec_resolver, run_call, run_call_with, SpecResolver};
 pub use session::StaticSession;
 
 #[cfg(feature = "server")]
