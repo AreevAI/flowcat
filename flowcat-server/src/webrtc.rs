@@ -18,17 +18,15 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tracing::{error, info, warn};
 
-use flowcat_agent::DeclarativeBrain;
 use flowcat_core::observer::{FrameObserver, RtviObserver, RtviSink};
+use flowcat_core::{AgentBrain, SessionSource};
 use flowcat_transports::WebRtcTransport;
 
 use crate::events::RtfSink;
 use crate::run;
-use crate::server::AppState;
-use crate::session::StaticSession;
+use crate::server::{resolve_brain, AppState};
 
 /// str0m carrier rate — matches the realtime input rate (the S2S processors
 /// resample to 16 kHz in / 24 kHz out internally).
@@ -60,19 +58,28 @@ pub async fn playground_page() -> Html<&'static str> {
 }
 
 /// `POST /webrtc/offer` — accept the browser SDP offer and run the configured agent.
-pub async fn offer(State(state): State<AppState>, Json(body): Json<OfferRequest>) -> Response {
-    // Build the brain from the configured graph BEFORE accepting the offer, so a
-    // bad graph is a clean 422 with no peer created.
-    let brain = match DeclarativeBrain::new(
-        state.graph.as_ref(),
-        Value::Object(Default::default()),
-        state.config.agent.seed_vars.clone(),
-    ) {
+///
+/// Generic over the embedder's session/brain: the call is resolved through the
+/// session and the brain built from it (via the shared [`resolve_brain`]) BEFORE a
+/// peer is created, so a bad resolve/graph is a clean error with no media bound.
+pub async fn offer<S, B>(
+    State(state): State<AppState<S, B>>,
+    Json(body): Json<OfferRequest>,
+) -> Response
+where
+    S: SessionSource + 'static,
+    B: AgentBrain + 'static,
+{
+    // The playground assigns the per-call id up front so `resolve` can key off it;
+    // the WebRTC path carries no carrier token.
+    let run_id = state.next_pc.fetch_add(1, Ordering::Relaxed) as i64;
+    let pc_id = format!("pc-{run_id}");
+
+    // Resolve + build the brain BEFORE accepting the offer, so a bad resolve/graph
+    // is a clean error with no peer created.
+    let brain = match resolve_brain(&state, run_id, "").await {
         Ok(b) => b,
-        Err(e) => {
-            warn!(error = %e, "webrtc offer: invalid agent graph");
-            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
-        }
+        Err(r) => return r,
     };
 
     // Bind a UDP socket for the WebRTC media on the configured interface (str0m
@@ -100,21 +107,14 @@ pub async fn offer(State(state): State<AppState>, Json(body): Json<OfferRequest>
             }
         };
 
-    let run_id = state.next_pc.fetch_add(1, Ordering::Relaxed) as i64;
-    let pc_id = format!("pc-{run_id}");
-
     // Register the live-event channel BEFORE returning the answer so opening
     // markers aren't lost to a subscribe race.
     let (call_events, guard) = state.events.register(&pc_id);
     let sink: Arc<dyn RtviSink> = Arc::new(RtfSink::new(call_events));
     let observers: Vec<Arc<dyn FrameObserver>> = vec![Arc::new(RtviObserver::new(sink))];
 
-    let session = StaticSession::new(
-        (*state.graph).clone(),
-        state.config.agent.seed_vars.clone(),
-        "webrtc",
-    );
-    let topology = state.config.topology.clone();
+    let session = Arc::clone(&state.session);
+    let topology = Arc::clone(&state.topology);
     info!(pc_id = %pc_id, "webrtc offer accepted; running call detached");
     let call_pc = pc_id.clone();
     tokio::spawn(async move {
@@ -143,11 +143,13 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::server::{build_router, AppState};
+    use crate::session::StaticSession;
     use axum::body::Body;
     use axum::http::Request;
+    use flowcat_agent::DeclarativeBrain;
     use tower::ServiceExt;
 
-    fn state() -> AppState {
+    fn state() -> AppState<StaticSession, DeclarativeBrain> {
         let config = ServerConfig::parse(
             r#"{ "agent": { "graph_inline": {"nodes":[{"id":"s","type":"startCall","data":{"prompt":"hi"}},{"id":"e","type":"endCall"}],"edges":[{"id":"x","source":"s","target":"e","label":"done"}]} },
                  "topology": { "mode": "realtime", "provider": "gemini" } }"#,
