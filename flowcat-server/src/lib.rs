@@ -25,5 +25,10 @@ pub mod server;
 #[cfg(feature = "server")]
 pub mod socket;
 
+#[cfg(feature = "webrtc")]
+pub mod events;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
+
 pub use config::{ConfigError, ServerConfig, TopologyConfig};
 pub use session::StaticSession;

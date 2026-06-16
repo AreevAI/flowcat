@@ -979,6 +979,7 @@ dependencies = [
  "flowcat-core",
  "flowcat-services",
  "flowcat-telephony",
+ "flowcat-transports",
  "futures-util",
  "serde",
  "serde_json",

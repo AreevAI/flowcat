@@ -27,6 +27,9 @@ server = [
     "flowcat-services/llm-all",
     "flowcat-services/realtime-all",
 ]
+# The browser WebRTC playground: the page, the SDP-offer endpoint over a str0m
+# transport, and the live-events WebSocket. Implies `server`.
+webrtc = ["server", "dep:flowcat-transports", "flowcat-transports/webrtc-str0m"]
 
 [dependencies]
 flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
@@ -37,6 +40,8 @@ flowcat-services = { path = "../flowcat-services", version = "0.1.0", default-fe
 flowcat-agent = { path = "../flowcat-agent", version = "0.1.0", optional = true }
 # Plivo answer XML (only needed by the server binary).
 flowcat-telephony = { path = "../flowcat-telephony", version = "0.1.0", optional = true }
+# str0m WebRTC transport (only needed by the `webrtc` playground feature).
+flowcat-transports = { path = "../flowcat-transports", version = "0.1.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

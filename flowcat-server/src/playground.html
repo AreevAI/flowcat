@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Flowcat Playground</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.4rem; }
+      button { font-size: 1rem; padding: 0.5rem 1.1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
+      button[disabled] { opacity: 0.5; cursor: default; }
+      #status { margin: 0.75rem 0; font-size: 0.9rem; opacity: 0.8; }
+      #log { margin-top: 1rem; border: 1px solid #8884; border-radius: 8px; padding: 0.75rem; min-height: 12rem; }
+      .turn { margin: 0.35rem 0; line-height: 1.4; }
+      .user { color: #2563eb; }
+      .bot { color: #16a34a; }
+      .tool { color: #9333ea; font-style: italic; }
+      .meta { opacity: 0.6; font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Flowcat Playground</h1>
+    <p class="meta">Talk to the configured agent in your browser. Allow microphone access, then click Start.</p>
+    <button id="start">Start call</button>
+    <button id="stop" disabled>Hang up</button>
+    <p id="status">idle</p>
+    <div id="log"></div>
+
+    <script>
+      const startBtn = document.getElementById("start");
+      const stopBtn = document.getElementById("stop");
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+
+      let pc = null;
+      let micStream = null;
+      let eventsWs = null;
+      let userInterim = null; // the in-progress user transcript line
+
+      const setStatus = (s) => { statusEl.textContent = s; };
+
+      function line(cls, text) {
+        const div = document.createElement("div");
+        div.className = "turn " + cls;
+        div.textContent = text;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+        return div;
+      }
+
+      // Wait until ICE gathering finishes so the offer SDP carries candidates
+      // (the server replies with a single non-trickle answer).
+      function iceComplete(pc) {
+        if (pc.iceGatheringState === "complete") return Promise.resolve();
+        return new Promise((resolve) => {
+          const check = () => {
+            if (pc.iceGatheringState === "complete") {
+              pc.removeEventListener("icegatheringstatechange", check);
+              resolve();
+            }
+          };
+          pc.addEventListener("icegatheringstatechange", check);
+        });
+      }
+
+      function handleEvent(msg) {
+        const { type, payload } = msg;
+        const p = payload || {};
+        switch (type) {
+          case "rtf-user-transcription":
+            if (!userInterim) userInterim = line("user", "🧑 ");
+            userInterim.textContent = "🧑 " + (p.text || "");
+            if (p.final) userInterim = null;
+            break;
+          case "rtf-bot-text":
+            line("bot", "🤖 " + (p.text || ""));
+            break;
+          case "rtf-function-call-start":
+            line("tool", "🔧 " + (p.function_name || p.tool_name || "tool") + "(…)");
+            break;
+          case "rtf-function-call-end":
+            line("tool", "🔧 ↪ " + JSON.stringify(p.result ?? p));
+            break;
+          case "rtf-bot-started-speaking":
+            setStatus("agent speaking…");
+            break;
+          case "rtf-bot-stopped-speaking":
+            setStatus("listening…");
+            break;
+          default:
+            break; // ignore other rtf-* kinds
+        }
+      }
+
+      async function start() {
+        startBtn.disabled = true;
+        setStatus("requesting microphone…");
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (e) {
+          setStatus("microphone denied: " + e);
+          startBtn.disabled = false;
+          return;
+        }
+
+        pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+        micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+
+        // Play the agent's audio.
+        pc.ontrack = (ev) => {
+          const audio = new Audio();
+          audio.autoplay = true;
+          audio.srcObject = ev.streams[0];
+        };
+        pc.onconnectionstatechange = () => {
+          if (["failed", "disconnected", "closed"].includes(pc.connectionState)) stop();
+        };
+
+        setStatus("negotiating…");
+        await pc.setLocalDescription(await pc.createOffer({ offerToReceiveAudio: true }));
+        await iceComplete(pc);
+
+        let resp;
+        try {
+          resp = await fetch("/webrtc/offer", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ sdp: pc.localDescription.sdp }),
+          });
+        } catch (e) {
+          setStatus("offer failed: " + e);
+          return stop();
+        }
+        if (!resp.ok) {
+          setStatus("offer rejected: " + resp.status + " " + (await resp.text()));
+          return stop();
+        }
+        const { sdp, pc_id } = await resp.json();
+        await pc.setRemoteDescription({ type: "answer", sdp });
+
+        // Subscribe to the live transcript.
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        eventsWs = new WebSocket(`${proto}://${location.host}/webrtc/events/${pc_id}`);
+        eventsWs.onmessage = (ev) => {
+          try { handleEvent(JSON.parse(ev.data)); } catch (_) {}
+        };
+
+        stopBtn.disabled = false;
+        setStatus("connected — listening…");
+      }
+
+      function stop() {
+        if (eventsWs) { try { eventsWs.close(); } catch (_) {} eventsWs = null; }
+        if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+        if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        setStatus("idle");
+      }
+
+      startBtn.addEventListener("click", start);
+      stopBtn.addEventListener("click", stop);
+    </script>
+  </body>
+</html>

@@ -31,9 +31,19 @@ const CARRIER_RATE: u32 = 8_000;
 /// startup) + this host's public base URL (for the Plivo answer XML).
 #[derive(Clone)]
 pub struct AppState {
-    config: Arc<ServerConfig>,
-    graph: Arc<Value>,
-    public_url: Arc<Option<String>>,
+    pub(crate) config: Arc<ServerConfig>,
+    pub(crate) graph: Arc<Value>,
+    pub(crate) public_url: Arc<Option<String>>,
+    /// Per-call live-event channels for the WebRTC playground.
+    #[cfg(feature = "webrtc")]
+    pub(crate) events: Arc<crate::events::EventRegistry>,
+    /// Monotonic per-call id source (`pc-<n>`).
+    #[cfg(feature = "webrtc")]
+    pub(crate) next_pc: Arc<std::sync::atomic::AtomicU64>,
+    /// Concrete IPv4 the str0m media socket binds (str0m rejects 0.0.0.0); from
+    /// `FLOWCAT_WEBRTC_BIND_IP`, default loopback.
+    #[cfg(feature = "webrtc")]
+    pub(crate) webrtc_bind_ip: std::net::Ipv4Addr,
 }
 
 impl AppState {
@@ -43,18 +53,40 @@ impl AppState {
             config: Arc::new(config),
             graph: Arc::new(graph),
             public_url: Arc::new(public_url),
+            #[cfg(feature = "webrtc")]
+            events: Arc::new(crate::events::EventRegistry::new()),
+            #[cfg(feature = "webrtc")]
+            next_pc: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "webrtc")]
+            webrtc_bind_ip: webrtc_bind_ip_from_env(),
         }
     }
 }
 
+/// Resolve the WebRTC media bind IP from `FLOWCAT_WEBRTC_BIND_IP` (default
+/// `127.0.0.1`; str0m advertises it as the host ICE candidate and rejects 0.0.0.0).
+#[cfg(feature = "webrtc")]
+fn webrtc_bind_ip_from_env() -> std::net::Ipv4Addr {
+    std::env::var("FLOWCAT_WEBRTC_BIND_IP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST)
+}
+
 /// Assemble the axum router over the shared [`AppState`].
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/telephony/ws/{provider}/{run_id}", get(media_ws))
-        .route("/telephony/answer/plivo/{run_id}", get(answer_plivo))
-        .with_state(state)
+        .route("/telephony/answer/plivo/{run_id}", get(answer_plivo));
+    // The browser playground (page + WebRTC offer + live-events WS).
+    #[cfg(feature = "webrtc")]
+    let router = router
+        .route("/", get(crate::webrtc::playground_page))
+        .route("/webrtc/offer", axum::routing::post(crate::webrtc::offer))
+        .route("/webrtc/events/{pc_id}", get(crate::events::events_ws));
+    router.with_state(state)
 }
 
 async fn healthz() -> impl IntoResponse {
