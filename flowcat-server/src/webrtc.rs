@@ -150,8 +150,16 @@ where
 /// `POST /webrtc/offer` — accept the browser SDP offer and run the configured agent.
 ///
 /// Generic over the embedder's session/brain: the call is resolved through the
-/// session and the brain built from it (via the shared [`resolve_brain`]) BEFORE a
+/// session and the brain built from it (via the shared `resolve_brain`) BEFORE a
 /// peer is created, so a bad resolve/graph is a clean error with no media bound.
+///
+/// This is flowcat-server's **own playground wrapper**: it mints the per-call
+/// `run_id` from an in-process counter and resolves with an empty token, which only
+/// makes sense for a control-plane-free session (the [`crate::session::StaticSession`]
+/// default). An embedder with a real control plane — whose session keys off a
+/// caller-supplied run id / token — should call [`handle_offer`] directly with those
+/// values rather than reuse this handler. (The carrier media-WS handler already
+/// takes the run id + token from the request and is the injectable seam there.)
 pub async fn offer<S, B>(
     State(state): State<AppState<S, B>>,
     Json(body): Json<OfferRequest>,
