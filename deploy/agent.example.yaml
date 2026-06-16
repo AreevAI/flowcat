@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A minimal single-agent config for flowcat-server. Full schema:
+# flowcat-server/src/config.rs. Provider API keys are NOT here — they come from
+# the environment (GOOGLE_API_KEY, DEEPGRAM_API_KEY, …).
+agent:
+  graph_inline:
+    nodes:
+      - id: start
+        type: startCall
+        data: { prompt: "Hi! Thanks for calling. How can I help today?" }
+      - id: done
+        type: endCall
+        data: { prompt: "Thanks for calling. Goodbye!" }
+    edges:
+      - id: e1
+        source: start
+        target: done
+        label: "Wrap up"
+        data: { condition: "The caller is finished" }
+  seed_vars: {}
+
+topology:
+  mode: realtime # realtime (speech-to-speech) | cascaded (STT -> LLM -> TTS)
+  provider: gemini # realtime provider; needs GOOGLE_API_KEY
+  # model: gemini-2.0-flash
+  # For cascaded instead:
+  # mode: cascaded
+  # stt: { provider: deepgram, model: nova-3 }   # needs DEEPGRAM_API_KEY
+  # llm: { provider: openai, model: gpt-4o }     # needs OPENAI_API_KEY
+  # tts: { provider: cartesia, model: <voice> }  # needs CARTESIA_API_KEY
+
+transport:
+  kind: webrtc # webrtc (browser playground) | ws-plivo | sip
+
+server:
+  bind: "0.0.0.0:6210"
