@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Run flowcat-server in Docker. Copy .env.example to .env and fill the provider
+# key(s) your topology uses, then: docker compose -f deploy/docker-compose.yml up --build
+#
+# For the browser playground (str0m WebRTC), build with the `webrtc` feature:
+#   FLOWCAT_FEATURES=webrtc docker compose -f deploy/docker-compose.yml up --build
+services:
+  flowcat-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        FEATURES: ${FLOWCAT_FEATURES:-server}
+    image: flowcat-server:local
+    ports:
+      - "6210:6210"
+    environment:
+      # Provider keys — at least the one your topology uses (see .env.example).
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      # Telephony only: the public https URL Plivo fetches the answer XML from.
+      FLOWCAT_PUBLIC_URL: ${FLOWCAT_PUBLIC_URL:-}
+      # WebRTC playground: the host IP str0m advertises (reachable, not 0.0.0.0).
+      FLOWCAT_WEBRTC_BIND_IP: ${FLOWCAT_WEBRTC_BIND_IP:-127.0.0.1}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./agent.example.yaml:/etc/flowcat/agent.yaml:ro

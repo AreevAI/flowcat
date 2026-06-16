@@ -62,3 +62,11 @@ jobs:
         run: cargo test -p flowcat-transports --locked --features webrtc-str0m,ws,daily,livekit,local
       - name: flowcat-telephony (every serializer)
         run: cargo test -p flowcat-telephony --locked --features twilio,telnyx,exotel,vonage,genesys,asterisk,cloudonix,vobiz,dtmf-inband
+      # The config-driven server + the browser WebRTC playground are feature-gated
+      # (axum/tokio/str0m), so the default-features job above does not reach them.
+      # `webrtc` implies `server`, so this exercises both the HTTP server and the
+      # playground, plus the full provider connector set the binary can run.
+      - name: flowcat-server (server + webrtc playground)
+        run: |
+          cargo clippy -p flowcat-server --locked --features webrtc --all-targets -- -D warnings
+          cargo test -p flowcat-server --locked --features webrtc

@@ -21,9 +21,13 @@
 //! rsipstack owns *signaling only*. For each established call we hand-roll the
 //! media: bind a fresh RTP `UdpSocket`, put its address + our G.711 offer/answer
 //! in the SDP, parse the peer's SDP for their RTP address + chosen codec, and
-//! build a [`SipTransport`] (RTP ↔ `MediaIn`). The negotiated dialog's state
-//! channel is watched so a BYE / `Terminated` fires the transport's hangup token,
-//! which surfaces as [`MediaIn::Stop`](crate::transport::MediaIn::Stop).
+//! build a [`SipTransport`] (RTP ↔ `MediaIn`). A per-call supervisor
+//! ([`spawn_dialog_supervisor`]) bridges the two teardown directions: a peer BYE
+//! / `Terminated` fires the transport's hangup token (surfacing as
+//! [`MediaIn::Stop`](crate::transport::MediaIn::Stop)), while the agent ending the
+//! call (the `SipTransport` is dropped) makes the supervisor send a BYE to the
+//! peer. Either way it removes the dialog from the layer's map so dialogs can't
+//! leak across calls.
 //!
 //! ## What is gated on a live trunk
 //!
@@ -38,10 +42,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rsipstack::dialog::authenticate::Credential;
+use rsipstack::dialog::client_dialog::ClientInviteDialog;
 use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver, DialogStateSender};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::server_dialog::ServerInviteDialog;
+use rsipstack::dialog::DialogId;
 use rsipstack::sip as rsip;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::transaction::endpoint::EndpointInnerRef;
@@ -49,7 +55,7 @@ use rsipstack::transaction::TransactionReceiver;
 use rsipstack::transport::{udp::UdpConnection, TransportLayer};
 use rsipstack::EndpointBuilder;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::FlowcatError;
@@ -71,6 +77,15 @@ pub const DEFAULT_RTP_PORT_BASE: u16 = 16000;
 pub const DEFAULT_RTP_PORT_TRIES: u16 = 200;
 /// Floor on the re-REGISTER interval (seconds) regardless of the server's expiry.
 const MIN_REREGISTER_SECS: u64 = 30;
+/// Consecutive REGISTER failures after which the refresh loop escalates its log
+/// from `warn` to `error`: by this point the trunk has been unreachable long
+/// enough that inbound calls are being lost, i.e. it is worth alerting on (the
+/// loop keeps retrying regardless; see [`SipAgent::is_registered`] to observe it).
+const REGISTER_ESCALATE_AFTER: u32 = 3;
+/// Time bound for best-effort teardown signaling — the BYE sent on a local hangup
+/// and the `Expires: 0` de-REGISTER on a graceful shutdown — so a dead peer or
+/// registrar can't pin the task for a full SIP transaction timeout (~32 s).
+const SIGNALING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for a [`SipAgent`] (one trunk).
 #[derive(Debug, Clone)]
@@ -114,6 +129,10 @@ pub struct InboundInvite {
     offer: sdp::SdpMedia,
     /// The rsipstack server dialog to accept/reject.
     dialog: ServerInviteDialog,
+    /// The dialog layer this dialog lives in, so teardown (answer's supervisor or
+    /// `reject`) can remove it from the layer's map — otherwise every inbound call
+    /// permanently leaks a dialog there.
+    dialog_layer: Arc<DialogLayer>,
     /// IP we advertise in the SDP answer (public IP or local).
     advertise_ip: Ipv4Addr,
     /// RTP bind range (base, count) for the answer's media socket — carried from
@@ -146,7 +165,12 @@ impl InboundInvite {
             .map_err(|e| FlowcatError::Transport(format!("SIP accept failed: {e}")))?;
 
         let hangup = CancellationToken::new();
-        spawn_dialog_watch(self.state_rx, hangup.clone());
+        spawn_dialog_supervisor(
+            DialogHandle::Server(self.dialog),
+            self.dialog_layer,
+            self.state_rx,
+            hangup.clone(),
+        );
 
         Ok(SipTransport::start(
             rtp_sock,
@@ -159,9 +183,13 @@ impl InboundInvite {
 
     /// Reject this INVITE (default 486 Busy Here unless a code is given).
     pub fn reject(self, code: Option<rsip::StatusCode>) {
+        let id = self.dialog.id();
         let _ = self
             .dialog
             .reject(Some(code.unwrap_or(rsip::StatusCode::BusyHere)), None);
+        // The pump created this server dialog in the layer's map; drop it now so a
+        // rejected INVITE can't leak (no supervisor runs for a rejected call).
+        self.dialog_layer.remove_dialog(&id);
     }
 }
 
@@ -174,6 +202,15 @@ pub struct SipAgent {
     inbound_rx: Mutex<mpsc::Receiver<InboundInvite>>,
     /// IP advertised in SDP (public IP if configured, else the bound local addr).
     advertise_ip: Ipv4Addr,
+    /// Live registration state from the refresh loop: `true` while the trunk is
+    /// registered, `false` when de-registered or after a failed refresh. Initialized
+    /// `true` for a credential-less trunk (nothing to register). Read it via
+    /// [`SipAgent::is_registered`] / [`SipAgent::watch_registered`] for health checks.
+    registered: watch::Receiver<bool>,
+    /// Child cancel token for *just* the REGISTER refresh loop, so
+    /// [`SipAgent::unregister`] can stop the auto-refresh (and let an `Expires: 0`
+    /// land) without tearing down the still-needed endpoint.
+    register_cancel: CancellationToken,
     /// Root cancel token; dropping the agent (or calling [`SipAgent::shutdown`])
     /// tears down the endpoint + all background tasks.
     cancel: CancellationToken,
@@ -244,12 +281,20 @@ impl SipAgent {
             cancel.clone(),
         ));
 
+        // Registration state, observable for health checks. A credential-less
+        // trunk needs no REGISTER, so it starts (and stays) "registered".
+        let (registered_tx, registered_rx) = watch::channel(cfg.password.is_empty());
+        // The refresh loop gets its own child token so `unregister` can stop just
+        // the loop while the endpoint keeps running long enough to send Expires:0.
+        let register_cancel = cancel.child_token();
+
         // Registration loop (only if a password is configured).
         if !cfg.password.is_empty() {
             tokio::spawn(register_loop(
                 endpoint_inner.clone(),
                 cfg.clone(),
-                cancel.clone(),
+                register_cancel.clone(),
+                registered_tx,
             ));
         }
 
@@ -259,6 +304,8 @@ impl SipAgent {
             dialog_layer,
             inbound_rx: Mutex::new(inbound_rx),
             advertise_ip,
+            registered: registered_rx,
+            register_cancel,
             cancel,
         })
     }
@@ -288,6 +335,57 @@ impl SipAgent {
             )));
         }
         Ok(reg.expires())
+    }
+
+    /// Whether the trunk is currently registered (the last REGISTER refresh
+    /// succeeded). A credential-less trunk — which needs no registration — always
+    /// reports `true`. Use this for a liveness/health probe: a `false` here means
+    /// inbound calls will not arrive even though the agent is otherwise running.
+    pub fn is_registered(&self) -> bool {
+        *self.registered.borrow()
+    }
+
+    /// A [`watch::Receiver`] that yields each change to the registration state, so
+    /// an embedder can react to de-registration (alert, drain, fail a readiness
+    /// check) rather than poll [`SipAgent::is_registered`].
+    pub fn watch_registered(&self) -> watch::Receiver<bool> {
+        self.registered.clone()
+    }
+
+    /// Politely de-register the trunk (a REGISTER with `Expires: 0`) so the
+    /// registrar drops our binding immediately instead of holding it until the
+    /// granted expiry. Stops the auto-refresh loop first so it can't re-bind us,
+    /// then sends the de-REGISTER; call this before [`SipAgent::shutdown`] on a
+    /// graceful stop. Best-effort and time-bounded. A no-op without credentials.
+    pub async fn unregister(&self) -> Result<(), FlowcatError> {
+        // Stop the refresh loop first; otherwise it could REGISTER us straight back
+        // in right after the Expires:0 below. The endpoint stays up (root cancel
+        // untouched), so we can still send the de-REGISTER.
+        self.register_cancel.cancel();
+        if self.cfg.password.is_empty() {
+            return Ok(());
+        }
+        let credential = Credential {
+            username: self.cfg.login.clone(),
+            password: self.cfg.password.clone(),
+            realm: None,
+        };
+        let server = parse_server_uri(&self.cfg.server)?;
+        let mut reg = rsipstack::dialog::registration::Registration::new(
+            self.endpoint_inner.clone(),
+            Some(credential),
+        );
+        let resp = tokio::time::timeout(SIGNALING_TIMEOUT, reg.register(server, Some(0)))
+            .await
+            .map_err(|_| FlowcatError::Transport("de-REGISTER timed out".into()))?
+            .map_err(|e| FlowcatError::Transport(format!("de-REGISTER failed: {e}")))?;
+        if resp.status_code != rsip::StatusCode::OK {
+            return Err(FlowcatError::Transport(format!(
+                "de-REGISTER rejected: {}",
+                resp.status_code
+            )));
+        }
+        Ok(())
     }
 
     /// Yield the next inbound INVITE, or `None` once the agent is shut down.
@@ -355,7 +453,15 @@ impl SipAgent {
 
         let call_id = dialog.id().call_id.to_string();
         let hangup = CancellationToken::new();
-        spawn_dialog_watch(state_rx, hangup.clone());
+        // Retain the confirmed client dialog in the supervisor: it both lets us
+        // BYE the peer when the agent ends the call and removes the dialog from the
+        // layer's map on teardown (do_invite leaves the confirmed dialog there).
+        spawn_dialog_supervisor(
+            DialogHandle::Client(dialog),
+            self.dialog_layer.clone(),
+            state_rx,
+            hangup.clone(),
+        );
 
         Ok(SipTransport::start(
             rtp_sock,
@@ -366,31 +472,116 @@ impl SipAgent {
         ))
     }
 
-    /// Tear down the agent: cancels the endpoint serve loop + all tasks.
-    pub fn shutdown(&self) {
+    /// Gracefully tear down the agent: politely de-register the trunk
+    /// ([`SipAgent::unregister`] — best-effort and time-bounded) and then cancel
+    /// the endpoint serve loop + all background tasks.
+    ///
+    /// Prefer this over just dropping the agent: `Drop` is a hard stop that cancels
+    /// everything immediately and — being synchronous — cannot send the
+    /// `Expires: 0` de-REGISTER, so the registrar would hold a stale binding until
+    /// it expires. A de-REGISTER failure here is logged, not fatal; teardown
+    /// proceeds regardless.
+    pub async fn shutdown(&self) {
+        if let Err(e) = self.unregister().await {
+            tracing::warn!(error = %e, "SIP de-REGISTER on shutdown failed; tearing down anyway");
+        }
         self.cancel.cancel();
     }
 }
 
 impl Drop for SipAgent {
     fn drop(&mut self) {
+        // Hard stop / safety net: cancel the endpoint + all tasks. Drop is sync, so
+        // it cannot de-REGISTER — call `shutdown().await` for a graceful stop that
+        // releases the trunk binding first.
         self.cancel.cancel();
     }
 }
 
-/// Watch a dialog's state channel; on `Terminated` (BYE / timeout / decline)
-/// fire `hangup` so the [`SipTransport`] surfaces `MediaIn::Stop`.
-fn spawn_dialog_watch(mut state_rx: DialogStateReceiver, hangup: CancellationToken) {
+/// A confirmed INVITE dialog we own for the life of a call: it can be ended (we
+/// send a BYE) and must be removed from the dialog layer's map on teardown.
+/// Unifies the inbound (server) and outbound (client) dialog types so one
+/// supervisor handles both legs.
+enum DialogHandle {
+    /// Inbound call: we answered a remote INVITE.
+    Server(ServerInviteDialog),
+    /// Outbound call: we placed the INVITE.
+    Client(ClientInviteDialog),
+}
+
+impl DialogHandle {
+    /// The dialog's id — the key it is stored under in the [`DialogLayer`] map.
+    fn id(&self) -> DialogId {
+        match self {
+            DialogHandle::Server(d) => d.id(),
+            DialogHandle::Client(d) => d.id(),
+        }
+    }
+
+    /// Send a BYE to end the dialog (no-op/`Err` if it is already terminated).
+    async fn bye(&self) -> rsipstack::Result<()> {
+        match self {
+            DialogHandle::Server(d) => d.bye().await,
+            DialogHandle::Client(d) => d.bye().await,
+        }
+    }
+}
+
+/// Supervise one established dialog for the whole call, handling teardown from
+/// either direction and always releasing the dialog from the layer's map:
+///
+/// - **Peer-initiated** (BYE / timeout / decline): a `Terminated` dialog state
+///   fires `hangup`, so the [`SipTransport`] surfaces
+///   [`MediaIn::Stop`](crate::transport::MediaIn::Stop).
+/// - **Agent-initiated** (the `Call` ended, so the `SipTransport` was dropped,
+///   which cancels `hangup`): we send a BYE to the peer so the dialog doesn't
+///   dangle half-open on the carrier until it times out.
+///
+/// Either way we then [`remove_dialog`](DialogLayer::remove_dialog), so the dialog
+/// map can't grow without bound across calls (rsipstack leaves both answered
+/// server dialogs and confirmed client dialogs in the map otherwise).
+fn spawn_dialog_supervisor(
+    handle: DialogHandle,
+    dialog_layer: Arc<DialogLayer>,
+    mut state_rx: DialogStateReceiver,
+    hangup: CancellationToken,
+) {
     tokio::spawn(async move {
-        while let Some(state) = state_rx.recv().await {
-            if let DialogState::Terminated(id, reason) = state {
-                tracing::debug!(%id, ?reason, "SIP dialog terminated");
-                hangup.cancel();
-                break;
+        let id = handle.id();
+        loop {
+            tokio::select! {
+                // The local side ended the call (SipTransport dropped → hangup
+                // cancelled). Tell the peer with a BYE, time-bounded so a dead peer
+                // can't pin this task for the full SIP transaction timeout.
+                _ = hangup.cancelled() => {
+                    match tokio::time::timeout(SIGNALING_TIMEOUT, handle.bye()).await {
+                        Ok(Ok(())) => tracing::debug!(%id, "sent BYE on local hangup"),
+                        Ok(Err(e)) => {
+                            tracing::debug!(%id, error = %e, "BYE on local hangup failed (already terminated?)");
+                        }
+                        Err(_) => tracing::debug!(%id, "BYE on local hangup timed out"),
+                    }
+                    break;
+                }
+                // A dialog state transition from rsipstack.
+                state = state_rx.recv() => match state {
+                    // The peer (or a timeout) terminated the dialog.
+                    Some(DialogState::Terminated(tid, reason)) => {
+                        tracing::debug!(%tid, ?reason, "SIP dialog terminated by peer");
+                        hangup.cancel();
+                        break;
+                    }
+                    // Early / Confirmed / mid-call states: keep supervising.
+                    Some(_) => continue,
+                    // Channel closed without an explicit Terminated → treat as hangup.
+                    None => {
+                        hangup.cancel();
+                        break;
+                    }
+                },
             }
         }
-        // Channel closed without an explicit Terminated → also treat as hangup.
-        hangup.cancel();
+        dialog_layer.remove_dialog(&id);
     });
 }
 
@@ -494,6 +685,28 @@ async fn handle_new_invite(
         }
     };
 
+    // Reserve a slot on the inbound queue *before* creating any dialog. The pump
+    // is the single signaling task, so it must not block here: if the host's
+    // accept loop is saturated (queue full) or gone (closed), shed this call with
+    // 503 rather than awaiting capacity — awaiting would stall in-dialog BYE/ACK
+    // for calls already in progress behind us. Reserving first also means we never
+    // create a server dialog we then can't hand off (which would leak it).
+    //
+    // (A retransmitted INVITE does not reach here a second time: rsipstack's
+    // transaction layer matches the retransmit to the in-flight or just-finished
+    // server transaction and replays the response, so each INVITE surfaces as
+    // exactly one transaction — no per-Call-ID dedup is needed at this layer.)
+    let permit = match inbound_tx.try_reserve() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(%call_id, "inbound queue full/closed; shedding INVITE with 503");
+            let _ = tx.reply(rsip::StatusCode::ServiceUnavailable).await;
+            return Err(FlowcatError::Transport(
+                "inbound queue full or closed".into(),
+            ));
+        }
+    };
+
     // Create the server dialog (allocates the To-tag) and its state channel.
     let (state_tx, state_rx): (DialogStateSender, DialogStateReceiver) =
         dialog_layer.new_dialog_state_channel();
@@ -514,22 +727,26 @@ async fn handle_new_invite(
         to_did,
         offer,
         dialog,
+        dialog_layer: dialog_layer.clone(),
         advertise_ip,
         rtp_port_base,
         rtp_port_tries,
         state_rx,
     };
-    inbound_tx
-        .send(invite)
-        .await
-        .map_err(|_| FlowcatError::Transport("inbound channel closed".into()))
+    permit.send(invite);
+    Ok(())
 }
 
-/// Background REGISTER + refresh loop (mirrors the rsipstack example).
+/// Background REGISTER + refresh loop. Keeps the trunk binding fresh, publishes
+/// the live registration state on `registered` (so the embedder can observe a
+/// trunk that has silently gone unreachable), and escalates its log from `warn`
+/// to `error` after [`REGISTER_ESCALATE_AFTER`] consecutive failures. It retries
+/// forever; cancellation (root shutdown or [`SipAgent::unregister`]) ends it.
 async fn register_loop(
     endpoint_inner: EndpointInnerRef,
     cfg: SipConfig,
     cancel: CancellationToken,
+    registered: watch::Sender<bool>,
 ) {
     let credential = Credential {
         username: cfg.login.clone(),
@@ -540,40 +757,69 @@ async fn register_loop(
         Ok(u) => u,
         Err(e) => {
             tracing::error!(error = %e, "SIP register loop: bad server URI; not registering");
+            let _ = registered.send(false);
             return;
         }
     };
     let mut reg =
         rsipstack::dialog::registration::Registration::new(endpoint_inner, Some(credential));
+    let mut consecutive_failures: u32 = 0;
     loop {
-        match reg.register(server.clone(), None).await {
+        let delay_secs = match reg.register(server.clone(), None).await {
             Ok(resp) if resp.status_code == rsip::StatusCode::OK => {
+                consecutive_failures = 0;
+                let _ = registered.send(true);
                 let expires = reg.expires();
                 tracing::info!(
                     expires = (expires as u64).max(MIN_REREGISTER_SECS),
                     "SIP registered"
                 );
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(reregister_delay_secs(expires))) => {}
-                }
+                reregister_delay_secs(expires)
             }
             Ok(resp) => {
-                tracing::warn!(status = %resp.status_code, "SIP register rejected; retrying");
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(MIN_REREGISTER_SECS)) => {}
-                }
+                consecutive_failures += 1;
+                let _ = registered.send(false);
+                log_register_failure(
+                    consecutive_failures,
+                    format_args!("rejected: {}", resp.status_code),
+                );
+                MIN_REREGISTER_SECS
             }
             Err(e) => {
-                tracing::warn!(error = %e, "SIP register error; retrying");
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(MIN_REREGISTER_SECS)) => {}
-                }
+                consecutive_failures += 1;
+                let _ = registered.send(false);
+                log_register_failure(consecutive_failures, format_args!("error: {e}"));
+                MIN_REREGISTER_SECS
             }
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = registered.send(false);
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
         }
     }
+}
+
+/// Log a REGISTER failure, escalating from `warn` to `error` once the trunk has
+/// failed [`REGISTER_ESCALATE_AFTER`] times in a row (by which point inbound calls
+/// are being lost and it is worth alerting on).
+fn log_register_failure(consecutive: u32, detail: std::fmt::Arguments<'_>) {
+    if register_failure_is_critical(consecutive) {
+        tracing::error!(
+            consecutive,
+            "SIP register {detail}; trunk is de-registered — inbound calls will not arrive"
+        );
+    } else {
+        tracing::warn!(consecutive, "SIP register {detail}; retrying");
+    }
+}
+
+/// Whether a run of `consecutive` REGISTER failures is severe enough to escalate
+/// the log to `error` (see [`REGISTER_ESCALATE_AFTER`]).
+fn register_failure_is_critical(consecutive: u32) -> bool {
+    consecutive >= REGISTER_ESCALATE_AFTER
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +998,18 @@ mod tests {
         assert_eq!(reregister_delay_secs(u32::MAX), (u32::MAX as u64) * 3 / 4);
     }
 
+    // ── re-REGISTER failure escalation (#7: a silently de-registered trunk must
+    //    eventually log at `error`, not stay at `warn` forever) ─────────────────
+    #[test]
+    fn register_failure_escalates_only_at_threshold() {
+        assert!(!register_failure_is_critical(0));
+        assert!(!register_failure_is_critical(1));
+        assert!(!register_failure_is_critical(REGISTER_ESCALATE_AFTER - 1));
+        // At and beyond the threshold it is critical (escalated to `error`).
+        assert!(register_failure_is_critical(REGISTER_ESCALATE_AFTER));
+        assert!(register_failure_is_critical(REGISTER_ESCALATE_AFTER + 100));
+    }
+
     /// Two RTP binds must get distinct ports (the scan steps past a taken port).
     #[tokio::test]
     async fn bind_rtp_socket_returns_distinct_ports() {
@@ -791,5 +1049,177 @@ mod tests {
             "RTP port {p} is odd despite odd base (RFC 3550 wants even)"
         );
         drop(s);
+    }
+
+    // ── Loopback signaling integration: two in-process `SipAgent`s call each
+    //    other over 127.0.0.1, exercising the dialog lifecycle end to end (setup,
+    //    agent-initiated BYE, reject) and asserting dialogs don't leak from the
+    //    `DialogLayer` map. Like the `transport.rs` tests these open real loopback
+    //    UDP sockets, but they are fully hermetic: no registrar, no credentials,
+    //    no external host. ─────────────────────────────────────────────────────
+    use crate::transport::media::{MediaIn, MediaTransport};
+
+    /// Grab a currently-free UDP port on loopback. The probe socket is released
+    /// immediately and rebound by the agent — fine for an in-process test.
+    async fn free_udp_port() -> u16 {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p = s.local_addr().unwrap().port();
+        drop(s);
+        p
+    }
+
+    /// Start a credential-less loopback agent on `sip_port`, advertising 127.0.0.1.
+    /// `server` is only consulted when the agent originates a call.
+    async fn start_loopback_agent(server: String, sip_port: u16) -> SipAgent {
+        let cfg = SipConfig {
+            server,
+            login: String::new(),
+            // Empty password → no REGISTER loop, so no registrar is needed.
+            password: String::new(),
+            caller_id: "1000".to_string(),
+            // Force the SDP/Contact/Via address to loopback so media + signaling
+            // both resolve to 127.0.0.1 regardless of the host's interfaces.
+            public_ip: Some(Ipv4Addr::LOCALHOST),
+            sip_port: Some(sip_port),
+            rtp_port_base: 40000,
+            rtp_port_tries: 200,
+        };
+        SipAgent::start(cfg).await.expect("agent start")
+    }
+
+    /// Poll `cond` every 20 ms for up to ~5 s; returns whether it became true.
+    async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+        for _ in 0..250 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cond()
+    }
+
+    /// Stand up a caller→callee pair on loopback. Returns both agents and both
+    /// media transports once the call is answered and confirmed.
+    async fn establish_loopback_call() -> (SipAgent, SipAgent, SipTransport, SipTransport) {
+        let port_b = free_udp_port().await;
+        let callee = start_loopback_agent("sip:127.0.0.1:1".to_string(), port_b).await;
+        let port_a = free_udp_port().await;
+        let caller = start_loopback_agent(format!("sip:127.0.0.1:{port_b}"), port_a).await;
+
+        // Answer on the callee side concurrently with the caller's originate.
+        let answer = tokio::spawn(async move {
+            let invite = tokio::time::timeout(Duration::from_secs(5), callee.next_inbound())
+                .await
+                .expect("inbound INVITE timed out")
+                .expect("callee shut down before INVITE");
+            // Identity comes from the SIP To user (the dialed number), not the body.
+            assert_eq!(invite.to_did, "2000");
+            let transport = invite.answer().await.expect("answer failed");
+            (callee, transport)
+        });
+
+        let caller_tr =
+            tokio::time::timeout(Duration::from_secs(5), caller.originate("2000", None))
+                .await
+                .expect("originate timed out")
+                .expect("outbound call not answered");
+        let (callee, callee_tr) = answer.await.expect("answer task panicked");
+        (caller, callee, caller_tr, callee_tr)
+    }
+
+    /// Drain `recv` past `StreamStart` and any (comfort-silence) audio until the
+    /// leg ends, asserting the terminal event is `Stop`.
+    async fn recv_until_stop(tr: &mut SipTransport) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), tr.recv())
+                .await
+                .expect("recv timed out waiting for Stop")
+            {
+                Some(MediaIn::StreamStart { .. }) | Some(MediaIn::Audio(_)) => continue,
+                other => {
+                    assert_eq!(other, Some(MediaIn::Stop), "expected Stop at end of leg");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A full call sets up one dialog per leg; the agent ending the call (dropping
+    /// its transport) must BYE the peer (→ the peer's leg sees `Stop`) and both
+    /// dialogs must be removed from their layers (the leak fix, #1/#2/#3).
+    #[tokio::test]
+    async fn loopback_agent_hangup_byes_peer_and_removes_both_dialogs() {
+        let (caller, callee, caller_tr, mut callee_tr) = establish_loopback_call().await;
+
+        // Both legs established → exactly one dialog in each layer.
+        assert!(
+            wait_until(|| caller.dialog_layer.len() == 1).await,
+            "caller dialog missing after answer"
+        );
+        assert!(
+            wait_until(|| callee.dialog_layer.len() == 1).await,
+            "callee dialog missing after answer"
+        );
+
+        // Agent-initiated hangup: the caller ends the call by dropping its
+        // transport. Its supervisor must send a BYE to the callee.
+        drop(caller_tr);
+
+        // The callee's leg sees the BYE as end-of-media (Stop)…
+        recv_until_stop(&mut callee_tr).await;
+        // …and both dialogs are released from their layers (no leak).
+        assert!(
+            wait_until(|| caller.dialog_layer.is_empty()).await,
+            "caller dialog leaked after hangup"
+        );
+        assert!(
+            wait_until(|| callee.dialog_layer.is_empty()).await,
+            "callee dialog leaked after BYE"
+        );
+
+        caller.shutdown().await;
+        callee.shutdown().await;
+    }
+
+    /// Rejecting an inbound INVITE returns an error to the caller (no transport)
+    /// and removes the server dialog the pump created (the reject leak fix).
+    #[tokio::test]
+    async fn loopback_rejected_call_errors_and_removes_dialog() {
+        let port_b = free_udp_port().await;
+        let callee = start_loopback_agent("sip:127.0.0.1:1".to_string(), port_b).await;
+        let port_a = free_udp_port().await;
+        let caller = start_loopback_agent(format!("sip:127.0.0.1:{port_b}"), port_a).await;
+
+        let reject = tokio::spawn(async move {
+            let invite = tokio::time::timeout(Duration::from_secs(5), callee.next_inbound())
+                .await
+                .expect("inbound INVITE timed out")
+                .expect("callee shut down before INVITE");
+            invite.reject(None); // 486 Busy Here
+            callee
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(5), caller.originate("2000", None))
+            .await
+            .expect("originate timed out");
+        assert!(
+            res.is_err(),
+            "a rejected call must not yield a media transport"
+        );
+
+        let callee = reject.await.expect("reject task panicked");
+        // The rejected server dialog must be gone (no leak); the caller's
+        // unconfirmed client dialog is dropped by do_invite on the non-2xx too.
+        assert!(
+            wait_until(|| callee.dialog_layer.is_empty()).await,
+            "callee dialog leaked after reject"
+        );
+        assert!(
+            wait_until(|| caller.dialog_layer.is_empty()).await,
+            "caller dialog leaked after reject"
+        );
+
+        caller.shutdown().await;
+        callee.shutdown().await;
     }
 }

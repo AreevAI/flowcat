@@ -1,0 +1,66 @@
+[package]
+name = "flowcat-server"
+description = "Config-driven single-agent server for the Flowcat voice runtime — run an agent from a YAML/JSON config with no control plane."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# The HTTP server binary (axum) + the providers it can run. Pulls the runtime
+# deps and enables the full flowcat-services connector set so the binary can run
+# any provider named in the config. The default (no-feature) build is just the
+# library: the config schema + StaticSession + the run-orchestration helpers.
+server = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:tracing-subscriber",
+    "dep:flowcat-agent",
+    "dep:flowcat-telephony",
+    "flowcat-services/stt-all",
+    "flowcat-services/tts-all",
+    "flowcat-services/llm-all",
+    "flowcat-services/realtime-all",
+]
+# The browser WebRTC playground: the page, the SDP-offer endpoint over a str0m
+# transport, and the live-events WebSocket. Implies `server`.
+webrtc = ["server", "dep:flowcat-transports", "flowcat-transports/webrtc-str0m"]
+
+[dependencies]
+flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
+# `default-features = false` → only the provider-factory types in the library
+# build; the `server` feature turns on the full connector set.
+flowcat-services = { path = "../flowcat-services", version = "0.1.0", default-features = false }
+# The declarative `AgentBrain` (only needed by the server binary).
+flowcat-agent = { path = "../flowcat-agent", version = "0.1.0", optional = true }
+# Plivo answer XML (only needed by the server binary).
+flowcat-telephony = { path = "../flowcat-telephony", version = "0.1.0", optional = true }
+# str0m WebRTC transport (only needed by the `webrtc` playground feature).
+flowcat-transports = { path = "../flowcat-transports", version = "0.1.0", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "2"
+# Server-only runtime deps.
+axum = { version = "0.8", features = ["ws"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `oneshot` the axum Router in offline server tests.
+tower = { version = "0.5", features = ["util"] }
+
+# The server binary builds only with `--features server`.
+[[bin]]
+name = "flowcat-server"
+path = "src/main.rs"
+required-features = ["server"]

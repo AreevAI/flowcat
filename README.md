@@ -20,12 +20,16 @@ pipeline model and the same provider breadth, packaged for teams that need to
 **own the stack** — self-hosted, auditable, and dense enough to run serious call
 volume per box. No pipecat code is vendored — see [`NOTICE`](NOTICE).
 
-**License:** Apache-2.0 ([`LICENSE`](LICENSE)) · **Status:** pre-1.0, building in
-the open.
+**▶ Watch the overview:**
+
+[![Flowcat — overview video](https://img.youtube.com/vi/XuR4jfJofhg/hqdefault.jpg)](https://youtu.be/XuR4jfJofhg)
+
+**Status:** pre-1.0, building in the open.
 
 > **New here?** → **[`QUICKSTART.md`](QUICKSTART.md)** takes you from `git clone` to
-> a running pipeline, a real WebSocket audio round-trip, and a Python-driven brain
-> in about five minutes — no credentials.
+> a running pipeline and a real audio round-trip in about five minutes (no
+> credentials), then to a **real agent you talk to in your browser** — define it in
+> YAML and run one binary (`flowcat-server`), no Rust required.
 
 ---
 
@@ -169,7 +173,28 @@ cargo run -p flowcat-cli -- pipeline           # in-process FrameProcessor pipel
 cargo run -p flowcat-cli -- ws-echo --loopback # real WebSocket PCM echo round-trip
 ```
 
-Embedding Flowcat in your own service, in three seams you implement:
+### Run an agent from a config — no Rust
+
+Don't want to embed Flowcat in a Rust binary? Run **`flowcat-server`**: describe
+one agent in a YAML/JSON config (a node/edge graph + the realtime or cascaded
+provider topology) and serve it over HTTP — no control plane, no database.
+
+```bash
+cargo build --release -p flowcat-server --features webrtc
+GOOGLE_API_KEY=… ./target/release/flowcat-server --config deploy/agent.example.yaml
+# open http://localhost:6210/ to talk to it (mic + live transcript), or bridge a
+# Plivo number to the server's /telephony/ws/plivo/{run_id}
+```
+
+Providers are selected **by name** from the config (the `flowcat-services`
+factory) and their keys come from the environment; the agent graph is run by
+`flowcat-agent`. A Dockerfile, compose file, sample config, and env template are
+in [`deploy/`](deploy/). The config schema lives in `flowcat-server/src/config.rs`.
+
+### Embed it in your own service
+
+For full control (custom routing, your own control plane, in-process brain logic),
+embed the library and implement three seams:
 
 - **`FrameProcessor` pipeline** — compose `transport.input() → vad → stt → llm →
   tts → transport.output()` (or a single realtime S2S model) into a `Pipeline`,
@@ -303,6 +328,7 @@ flowcat/
 ├── flowcat-transports/  # str0m WebRTC + Opus, WebSocket, Daily, LiveKit, local
 ├── flowcat-telephony/   # carrier FrameSerializers (Twilio/Telnyx/Plivo/…) + DTMF
 ├── flowcat-agent/       # declarative graph agent — a config-driven AgentBrain
+├── flowcat-server/      # config-driven single-agent server + browser playground
 ├── flowcat-cli/         # `flowcat` demo binary (DX / examples surface)
 ├── bench/               # the reproducible pipecat-vs-flowcat benchmark kit + RESULTS.md
 ├── bench-rs/            # standalone load-gen + framework micro-bench

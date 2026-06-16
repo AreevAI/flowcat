@@ -14,6 +14,14 @@ environment in production.** Setting `OPENAI_API_KEY` does not make a running
 Flowcat pick it up — your embedder reads its own credentials however it likes and
 passes them to the provider constructor.
 
+> **Running the bundled
+> [`flowcat-server`](./quickstart.md#5-talk-to-a-real-agent-in-your-browser-no-rust)
+> rather than embedding?** That binary *is* the config-driven host: it takes a
+> YAML/JSON config (the agent graph + provider topology) and *does* read provider
+> keys from the environment (`<PROVIDER>_API_KEY`, e.g. `GOOGLE_API_KEY`), so you
+> don't write one yourself. The "no config file / no env keys" rule above is about
+> embedding the **library** directly. Schema: `flowcat-server/src/config.rs`.
+
 > Contributing to Flowcat and running the live integration tests? Those use their
 > own `*_API_KEY` environment variables — see
 > [Building and running tests](./contributing.md#building-and-running-tests).

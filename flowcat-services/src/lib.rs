@@ -33,6 +33,11 @@ pub mod tts;
 
 pub mod llm;
 
+/// Provider **factory** — construct a boxed service from a provider *name* +
+/// options (string → `Box<dyn SttService>` etc.), for config-driven hosts.
+pub mod factory;
+pub use factory::ProviderSpec;
+
 pub mod observability;
 
 /// MCP-as-processor (pulls an MCP/HTTP client → sibling, not core).
