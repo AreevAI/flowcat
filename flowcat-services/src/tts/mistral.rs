@@ -116,10 +116,15 @@ pub fn build_body(text: &str, model: &str, voice: &str) -> Value {
 }
 
 /// Decode the Mistral SSE response body into PCM samples (pure seam). Each
-/// `data:` line is JSON; a `speech.audio.delta` event's `data.audio_data` is
-/// base64 float32 PCM, concatenated in order and converted to i16. Non-`data`
-/// lines, the `[DONE]` sentinel, malformed JSON, or other event types are skipped
-/// — never panics.
+/// `data:` line is JSON; a `speech.audio.delta` event carries base64 float32 PCM
+/// in `audio_data`, concatenated in order and converted to i16. Non-`data` lines,
+/// the `[DONE]` sentinel, malformed JSON, or other event types are skipped — never
+/// panics.
+///
+/// The live API tags the event kind on a top-level `type` field and puts
+/// `audio_data` at the top level (`{"type":"speech.audio.delta","audio_data":…}`);
+/// we also accept an `event` field and a nested `data.audio_data` so both shapes
+/// decode.
 pub fn decode_sse(body: &[u8]) -> Vec<i16> {
     let text = String::from_utf8_lossy(body);
     let mut pcm = Vec::new();
@@ -135,12 +140,16 @@ pub fn decode_sse(body: &[u8]) -> Vec<i16> {
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
-        if value.get("event").and_then(|e| e.as_str()) != Some("speech.audio.delta") {
+        let kind = value
+            .get("type")
+            .or_else(|| value.get("event"))
+            .and_then(|e| e.as_str());
+        if kind != Some("speech.audio.delta") {
             continue;
         }
         if let Some(b64) = value
-            .get("data")
-            .and_then(|d| d.get("audio_data"))
+            .get("audio_data")
+            .or_else(|| value.get("data").and_then(|d| d.get("audio_data")))
             .and_then(|a| a.as_str())
         {
             let f32_bytes = base64_decode(b64);
@@ -172,11 +181,12 @@ mod tests {
         d2_bytes.extend_from_slice(&(-1.0f32).to_le_bytes());
         d2_bytes.extend_from_slice(&0.0f32.to_le_bytes());
         let d2 = http::base64_encode(&d2_bytes);
+        // Live wire format: top-level `type` + `audio_data`.
         let sse = format!(
             "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n",
-            json!({ "event": "speech.audio.delta", "data": { "audio_data": d1 } }),
-            json!({ "event": "speech.audio.delta", "data": { "audio_data": d2 } }),
-            json!({ "event": "speech.audio.done" }),
+            json!({ "type": "speech.audio.delta", "audio_data": d1 }),
+            json!({ "type": "speech.audio.delta", "audio_data": d2 }),
+            json!({ "type": "speech.audio.done" }),
         );
         assert_eq!(decode_sse(sse.as_bytes()), vec![32767, -32767, 0]);
     }
