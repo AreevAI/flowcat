@@ -9,13 +9,16 @@
 //! ```text
 //! POST https://api.lmnt.com/v1/ai/speech/bytes
 //!   X-API-Key: <key>
-//!   { "text": "...", "voice": "...", "format": "raw", "sample_rate": 24000,
+//!   { "text": "...", "voice": "...", "format": "wav", "sample_rate": 24000,
 //!     "model": "aurora", "language": "en" }
 //! ```
 //!
-//! With `format: "raw"` the response body is headerless little-endian s16 PCM at
-//! the requested sample rate. [`build_payload`] / [`LmntTts::url`] are the **pure**
-//! seam.
+//! With `format: "wav"` the response body is a 16-bit little-endian PCM WAV at the
+//! requested sample rate (LMNT streams it with placeholder `0xFFFFFFFF` chunk
+//! sizes); [`strip_wav_header`](tail::strip_wav_header) extracts the s16 data. The
+//! `"raw"` format is avoided because it returns 32-bit float PCM
+//! (`application/vnd.lmnt.audio-fp32`), which the s16 framer would misread.
+//! [`build_payload`] / [`LmntTts::url`] are the **pure** seam.
 
 use std::sync::Arc;
 
@@ -85,13 +88,16 @@ impl LmntTts {
     }
 }
 
-/// Build the LMNT synthesis JSON body (pure — the request seam). `format: "raw"`
-/// requests headerless little-endian s16 PCM.
+/// Build the LMNT synthesis JSON body (pure — the request seam). `format: "wav"`
+/// requests a 16-bit little-endian PCM WAV at the chosen sample rate. (LMNT's
+/// `"raw"` format returns 32-bit float PCM — `application/vnd.lmnt.audio-fp32` —
+/// which the s16 framer would misread as buzz, so we take the WAV and strip its
+/// header.)
 fn build_payload(text: &str, voice: &str, sample_rate: u32, model: &str, lang: &str) -> Value {
     json!({
         "text": text,
         "voice": voice,
-        "format": "raw",
+        "format": "wav",
         "sample_rate": sample_rate,
         "model": model,
         "language": lang,
@@ -140,7 +146,7 @@ impl TtsService for LmntTts {
             .bytes()
             .await
             .map_err(|e| FlowcatError::Network(format!("lmnt body: {e}")))?;
-        // `format: raw` is headerless PCM, but tolerate a WAV body defensively.
+        // `format: wav` returns a 16-bit PCM WAV; strip the header to raw s16 PCM.
         let pcm = tail::strip_wav_header(&bytes);
         Ok(tail::one_shot_frames(pcm, self.sample_rate, context_id))
     }
@@ -155,7 +161,7 @@ mod tests {
         let p = build_payload("hi", "voice-x", 24_000, "aurora", "en");
         assert_eq!(p["text"], "hi");
         assert_eq!(p["voice"], "voice-x");
-        assert_eq!(p["format"], "raw");
+        assert_eq!(p["format"], "wav");
         assert_eq!(p["sample_rate"], 24_000);
         assert_eq!(p["model"], "aurora");
         assert_eq!(p["language"], "en");
