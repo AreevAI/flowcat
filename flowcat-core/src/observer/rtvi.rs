@@ -298,10 +298,10 @@ impl RtviObserver {
                     ));
                 }
             }
-            Frame::InterimTranscription { text, user_id, .. } => {
+            Frame::InterimTranscription { text, user_id, .. }
                 // Bot interims are dropped (only finalized bot text becomes a bubble);
                 // a bot interim must never render as a user bubble.
-                if user_id.as_ref() != "bot" && self.params.user_transcription_enabled {
+                if user_id.as_ref() != "bot" && self.params.user_transcription_enabled => {
                     self.emit(RtviMessage::with_data(
                         "user-transcription",
                         json!({
@@ -312,7 +312,6 @@ impl RtviObserver {
                         }),
                     ));
                 }
-            }
             Frame::LlmResponseStart if self.params.bot_llm_enabled => {
                 self.emit(RtviMessage::bare("bot-llm-started"));
             }

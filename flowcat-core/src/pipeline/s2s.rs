@@ -903,6 +903,12 @@ impl<B: AgentBrain + 'static, Rl: ToolRelay + 'static> FrameProcessor for BrainP
                 // the transition in the transcript (verbatim call.rs ordering:
                 // update_system, then send_tool_result, then transcript marker).
                 let tools = self.resolve_tools().await;
+                // The engine has already advanced inside `on_tool_call`, so the
+                // brain now reports the DESTINATION node. Label the transcript
+                // marker with that node's display name (not the internal transition
+                // slug `name`) so the stored/historical view matches the live rail
+                // (e.g. "Conversation", not "transition_0").
+                let node_name = self.brain.current_node_name();
                 link.push_up(Frame::Custom(Arc::new(Reprompt {
                     prompt: system_prompt,
                     tools,
@@ -914,8 +920,8 @@ impl<B: AgentBrain + 'static, Rl: ToolRelay + 'static> FrameProcessor for BrainP
                 })))
                 .await;
                 let marker = match &say {
-                    Some(s) if !s.is_empty() => format!("[transition: {name}] {s}"),
-                    _ => format!("[transition: {name}]"),
+                    Some(s) if !s.is_empty() => format!("[transition: {node_name}] {s}"),
+                    _ => format!("[transition: {node_name}]"),
                 };
                 self.state.lock().unwrap().transcript.push_bot(&marker);
             }
