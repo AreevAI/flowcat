@@ -8,11 +8,12 @@ conversation" in about five minutes — no credentials, no accounts, no cloud.
 end-to-end, a real WebSocket media round-trip, and your conversation policy driven
 from Python over the `RemoteBrain` seam.
 
-**What it does _not_ get you (yet):** a live PSTN phone call. That needs a small
-*embedder* you wire to your carrier and control plane — [step 5](#5-from-here-to-a-live-phone-call)
-shows exactly what that piece is and where the live-verified path starts. We'd
-rather you hit a working demo in five minutes than a phone call that needs an hour
-of setup to fail.
+**Then, with one provider key:**
+[step 5](#5-talk-to-a-real-agent-in-your-browser-no-rust) runs a *real* agent you
+talk to in your browser — **no Rust** — via the `flowcat-server` binary + a YAML
+config. A live **PSTN** call adds your own *embedder* (carrier + control plane);
+[step 6](#6-carry-a-pstn-call-with-your-own-embedder) shows what that piece is and
+where the live-verified path starts.
 
 Everything in steps 1–4 is exercised in CI, so it runs on the first try.
 
@@ -130,11 +131,37 @@ state machine. A Rust embedder wires this in with `RemoteBrain::connect(...)`; s
 *functions* as model tools instead, see
 [`examples/python-mcp-tools`](examples/python-mcp-tools).
 
-## 5. From here to a live phone call
+## 5. Talk to a real agent in your browser (no Rust)
 
-The steps above run the runtime in isolation. A real inbound/outbound PSTN call
-adds the one piece Flowcat deliberately leaves to you — the **embedder**: a small
-host binary that
+Steps 1–4 are credential-free. To run a *real* agent end-to-end with **no Rust**,
+use the **`flowcat-server`** binary: define the agent in a YAML config and serve
+it; the browser playground (`--features webrtc`) lets you talk to it directly.
+
+You need one provider key — the live-verified path is **Gemini Live**, so set
+`GOOGLE_API_KEY` (a free key from [Google AI Studio](https://aistudio.google.com/)
+works):
+
+```bash
+cargo build --release -p flowcat-server --features webrtc
+GOOGLE_API_KEY=… ./target/release/flowcat-server --config deploy/agent.example.yaml
+```
+
+Open **<http://localhost:6210/>**, allow the microphone, click **Start call** —
+and you're talking to the agent defined in
+[`deploy/agent.example.yaml`](deploy/agent.example.yaml): a node/edge graph you
+edit, with no control plane and no database. The live transcript renders as you
+speak. The server resolves providers **by name** from the config and reads their
+keys from the environment; the full schema is in `flowcat-server/src/config.rs`.
+
+> Prefer telephony? Point a Plivo number's answer webhook at the server's
+> `/telephony/answer/plivo/{run_id}` and it bridges the media WebSocket. Or run
+> the whole thing in Docker: `docker compose -f deploy/docker-compose.yml up
+> --build` — see [`deploy/README.md`](deploy/README.md).
+
+## 6. Carry a PSTN call with your own embedder
+
+For full control — your own routing, control plane, and in-process brain logic —
+you write a small **embedder**: a host binary that
 
 - **terminates the call** — the native in-process `SipTransport` (SIP/RTP, no
   softswitch required), or a carrier WebSocket transport if you already run one;

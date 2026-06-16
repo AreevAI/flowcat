@@ -5,11 +5,13 @@ air-gapped). Flowcat is one self-contained binary with no hosted control plane
 and no phone-home — deployment is "ship a binary, open the right ports, give it
 your provider credentials."
 
-> **What you actually deploy is *your* [embedder](./embedder.md)** — the small
-> host binary that terminates calls and supplies the brain. The bundled
-> `flowcat` CLI (`pipeline`, `ws-echo`) is for credential-free demos, **not** a
-> production server. Everything below applies to the release binary you build
-> from your embedder crate; the build mechanics are identical.
+> **Two ways to deploy.** The bundled **`flowcat-server`** binary runs one agent
+> from a YAML config (no Rust) and is deployable on its own — start with its
+> [Docker setup](https://github.com/AreevAI/flowcat/tree/main/deploy) and the
+> [Quickstart](./quickstart.md#5-talk-to-a-real-agent-in-your-browser-no-rust). For
+> full control you instead ship *your own* [embedder](./embedder.md). Either way the
+> build mechanics below are identical; the credential-free `flowcat` CLI
+> (`pipeline`, `ws-echo`) is for demos, **not** a server.
 
 ---
 
@@ -63,8 +65,20 @@ libraries — Whisper, ONNX — may need the matching musl system libraries.)
 
 ## 2. Containerize
 
-There is **no official image yet** — the only `Dockerfile` in the repo is the
-benchmark harness under `bench/`. A production multi-stage build is small:
+The repo ships a multi-stage
+[`Dockerfile`](https://github.com/AreevAI/flowcat/blob/main/Dockerfile) that builds
+**`flowcat-server`**, plus a
+[`deploy/`](https://github.com/AreevAI/flowcat/tree/main/deploy) compose file +
+sample config + env template:
+
+```bash
+cp deploy/.env.example deploy/.env          # fill the provider key(s) you use
+FLOWCAT_FEATURES=webrtc \
+  docker compose -f deploy/docker-compose.yml up --build   # then open :6210
+```
+
+To containerize *your own embedder* instead, the same multi-stage pattern applies
+— swap the build package + features and the `EXPOSE`d ports for your transport:
 
 ```dockerfile
 # ---- build ----
