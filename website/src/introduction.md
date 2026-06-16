@@ -15,12 +15,12 @@ pipeline model and the same provider breadth, packaged for teams that need to
 **own the stack** — self-hosted, auditable, and dense enough to run serious call
 volume per box.
 
-<!-- Overview video — replace VIDEO_ID with the YouTube id (the part after
-     youtu.be/ or watch?v=). Rendered by mdBook on the docs home page; GitHub
-     strips iframes from README.md, which is why this lives in the site source. -->
+<!-- Overview video (https://youtu.be/XuR4jfJofhg). Rendered by mdBook on the docs
+     home page; GitHub strips iframes from README.md, so the README links a
+     clickable thumbnail to the same video instead. -->
 <div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:960px;margin:1.5rem auto;border-radius:8px;">
   <iframe style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;"
-    src="https://www.youtube-nocookie.com/embed/VIDEO_ID"
+    src="https://www.youtube-nocookie.com/embed/XuR4jfJofhg"
     title="Flowcat — overview"
     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
     referrerpolicy="strict-origin-when-cross-origin"

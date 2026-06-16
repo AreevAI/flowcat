@@ -20,6 +20,10 @@ pipeline model and the same provider breadth, packaged for teams that need to
 **own the stack** — self-hosted, auditable, and dense enough to run serious call
 volume per box. No pipecat code is vendored — see [`NOTICE`](NOTICE).
 
+**▶ Watch the overview:**
+
+[![Flowcat — overview video](https://img.youtube.com/vi/XuR4jfJofhg/hqdefault.jpg)](https://youtu.be/XuR4jfJofhg)
+
 **Status:** pre-1.0, building in the open.
 
 > **New here?** → **[`QUICKSTART.md`](QUICKSTART.md)** takes you from `git clone` to
