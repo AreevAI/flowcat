@@ -218,10 +218,8 @@ impl FrameProcessor for VoicemailDetector {
                         Some(self.decide(Classification::Voicemail, DecisionReason::LongFirstTurn));
                 }
             }
-            Frame::VadUserStartedSpeaking { start_secs } => {
-                if self.turn_started_secs.is_none() {
-                    self.turn_started_secs = Some(*start_secs);
-                }
+            Frame::VadUserStartedSpeaking { start_secs } if self.turn_started_secs.is_none() => {
+                self.turn_started_secs = Some(*start_secs);
             }
             Frame::VadUserStoppedSpeaking { stop_secs } => {
                 // Evaluate the just-finished turn's duration.
