@@ -22,7 +22,7 @@ use flowcat_core::{
 };
 
 use crate::config::{ServerConfig, TopologyConfig};
-use crate::run;
+use crate::run::{self, SpecResolver};
 use crate::session::StaticSession;
 use crate::socket::AxumWsSocket;
 
@@ -48,6 +48,9 @@ pub struct AppState<S, B> {
     pub(crate) session: Arc<S>,
     pub(crate) brain_factory: BrainFactory<B>,
     pub(crate) topology: Arc<TopologyConfig>,
+    /// Resolves each call's provider specs (keys). Defaults to the env resolver;
+    /// an embedder overrides it via [`AppState::with_spec_resolver`].
+    pub(crate) spec_resolver: SpecResolver,
     pub(crate) public_url: Arc<Option<String>>,
     /// Per-call live-event channels for the WebRTC playground.
     #[cfg(feature = "webrtc")]
@@ -69,6 +72,7 @@ impl<S, B> Clone for AppState<S, B> {
             session: Arc::clone(&self.session),
             brain_factory: Arc::clone(&self.brain_factory),
             topology: Arc::clone(&self.topology),
+            spec_resolver: Arc::clone(&self.spec_resolver),
             public_url: Arc::clone(&self.public_url),
             #[cfg(feature = "webrtc")]
             events: Arc::clone(&self.events),
@@ -95,6 +99,9 @@ impl<S, B> AppState<S, B> {
             session,
             brain_factory,
             topology: Arc::new(topology),
+            // Default: resolve provider keys from the env (the standalone-server
+            // convention). An embedder swaps in its own via `with_spec_resolver`.
+            spec_resolver: Arc::new(run::env_spec_resolver),
             public_url: Arc::new(public_url),
             #[cfg(feature = "webrtc")]
             events: Arc::new(crate::events::EventRegistry::new()),
@@ -103,6 +110,14 @@ impl<S, B> AppState<S, B> {
             #[cfg(feature = "webrtc")]
             webrtc_bind_ip: webrtc_bind_ip_from_env(),
         }
+    }
+
+    /// Override how provider specs (API keys) are resolved per call — a platform
+    /// passes its own secret-store lookup so no provider key is read from the
+    /// process env on the call path. Defaults to [`run::env_spec_resolver`].
+    pub fn with_spec_resolver(mut self, resolver: SpecResolver) -> Self {
+        self.spec_resolver = resolver;
+        self
     }
 }
 
@@ -231,13 +246,24 @@ where
     let token = q.token;
     let session = Arc::clone(&state.session);
     let topology = Arc::clone(&state.topology);
+    let resolver = Arc::clone(&state.spec_resolver);
     info!(run_id, "plivo media ws upgrading");
     ws.on_upgrade(move |socket| async move {
         let transport = WsCarrierTransport::new(
             AxumWsSocket::new(socket),
             PlivoSerializer::new(CARRIER_RATE),
         );
-        let res = run::run_call(transport, &topology, brain, session, run_id, token, vec![]).await;
+        let res = run::run_call_with(
+            transport,
+            &topology,
+            &*resolver,
+            brain,
+            session,
+            run_id,
+            token,
+            vec![],
+        )
+        .await;
         match res {
             Ok(()) => info!(run_id, "plivo call ended cleanly"),
             Err(e) => error!(run_id, error = %e, "plivo call ended with error"),
