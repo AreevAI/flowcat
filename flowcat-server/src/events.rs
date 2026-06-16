@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use flowcat_core::observer::{RtviMessage, RtviSink};
+use flowcat_core::{AgentBrain, SessionSource};
 
 use crate::server::AppState;
 
@@ -146,12 +147,17 @@ fn map_rtvi_to_rtf(m: &RtviMessage) -> Option<(&'static str, Value)> {
 }
 
 /// `GET /webrtc/events/{pc_id}` — stream a call's `rtf-*` frames to the browser.
-/// Serves only a registered `pc_id` (unknown → 404).
-pub async fn events_ws(
-    State(state): State<AppState>,
+/// Serves only a registered `pc_id` (unknown → 404). Generic over the embedder's
+/// session/brain so it shares the one [`AppState`] the rest of the router uses.
+pub async fn events_ws<S, B>(
+    State(state): State<AppState<S, B>>,
     Path(pc_id): Path<String>,
     ws: WebSocketUpgrade,
-) -> Response {
+) -> Response
+where
+    S: SessionSource + 'static,
+    B: AgentBrain + 'static,
+{
     let Some(rx) = state.events.take_receiver(&pc_id) else {
         return (StatusCode::NOT_FOUND, "no such call").into_response();
     };
