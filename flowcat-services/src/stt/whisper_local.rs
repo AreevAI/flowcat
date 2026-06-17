@@ -219,19 +219,44 @@ fn run_inference(ctx: &WhisperContext, language: Option<&str>, samples: &[f32]) 
     Ok(out.trim().to_string())
 }
 
-/// Turn whisper's finalized segment text into transcription frames (empty text →
-/// nothing). **Pure** — the decode seam the fixture tests drive.
+/// Turn whisper's finalized segment text into transcription frames. **Pure** — the
+/// decode seam the fixture tests drive. whisper.cpp annotates non-speech audio with
+/// bracketed/parenthesised markers (`[BLANK_AUDIO]`, `[Music]`, `(silence)`, etc.);
+/// a segment that is only such markers (or empty/punctuation) yields **nothing** so
+/// silence never reaches the LLM as a "user turn".
 pub fn decode_segment_text(text: &str) -> Vec<Frame> {
-    let text = text.trim();
-    if text.is_empty() {
+    let spoken = strip_non_speech(text);
+    // Require at least one real word character — drops empty / whitespace /
+    // punctuation-only / pure-annotation segments.
+    if !spoken.chars().any(|c| c.is_alphanumeric()) {
         return vec![];
     }
     vec![Frame::Transcription {
-        text: text.to_string(),
+        text: spoken,
         user_id: Arc::from("user"),
         language: None,
         final_: true,
     }]
+}
+
+/// Strip whisper.cpp's non-speech annotations — `[...]` and `(...)` spans like
+/// `[BLANK_AUDIO]` / `[Music]` / `(silence)` — and collapse surrounding whitespace,
+/// leaving only the spoken words. **Pure.**
+fn strip_non_speech(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut square = 0i32;
+    let mut round = 0i32;
+    for c in text.chars() {
+        match c {
+            '[' => square += 1,
+            ']' => square = (square - 1).max(0),
+            '(' => round += 1,
+            ')' => round = (round - 1).max(0),
+            _ if square > 0 || round > 0 => {}
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Thread count for whisper inference, with a safe fallback.
@@ -338,6 +363,19 @@ mod tests {
     fn decode_empty_segment_yields_nothing() {
         assert!(decode_segment_text("").is_empty());
         assert!(decode_segment_text("   \n ").is_empty());
+    }
+
+    #[test]
+    fn decode_drops_non_speech_annotations() {
+        // whisper.cpp tags silence/noise; these must never become a user turn.
+        assert!(decode_segment_text("[BLANK_AUDIO]").is_empty());
+        assert!(decode_segment_text("[Music]").is_empty());
+        assert!(decode_segment_text("(silence)").is_empty());
+        assert!(decode_segment_text(" [Music] . ").is_empty());
+        // Real speech with a stray annotation keeps just the words.
+        let frames = decode_segment_text("[Music] book a dentist");
+        assert!(matches!(&frames[..],
+            [Frame::Transcription { text, .. }] if text == "book a dentist"));
     }
 
     #[test]
