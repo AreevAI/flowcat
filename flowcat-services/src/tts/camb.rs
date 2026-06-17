@@ -6,10 +6,12 @@
 //! (cross-checked against pipecat `services/camb/tts.py`, which drives the same
 //! endpoint via the Camb SDK): an `x-api-key: <key>` header and a JSON body
 //! `{ text, voice_id, language, speech_model, output_configuration: { format:
-//! "pcm_s16le" } }`. The response is **raw little-endian PCM** (`pcm_s16le`)
-//! streamed back; the trait buffers the whole utterance so the decode is a
-//! straight [`http::pcm_from_le_bytes`]. The request encode ([`build_body`]) is a
-//! pure, unit-tested seam. Behind the `tts-camb` feature.
+//! "wav" } }`. We request `wav` (not `pcm_s16le`): Camb's raw `pcm_s16le` stream
+//! comes back **truncated** (~40 % of the utterance), while `wav` returns the full
+//! audio as a canonical 48 kHz RIFF/WAVE body. The header is stripped with
+//! [`http::strip_wav_header`] and the PCM decoded by [`http::pcm_from_le_bytes`].
+//! The request encode ([`build_body`]) is a pure, unit-tested seam. Behind the
+//! `tts-camb` feature.
 
 use std::sync::Arc;
 
@@ -24,7 +26,9 @@ use flowcat_core::service::TtsService;
 #[path = "http_tts_common.rs"]
 pub mod http;
 
-use http::{pcm_from_le_bytes, tts_frames, HttpTtsBody, HttpTtsClient, HttpTtsRequest};
+use http::{
+    pcm_from_le_bytes, strip_wav_header, tts_frames, HttpTtsBody, HttpTtsClient, HttpTtsRequest,
+};
 
 /// Camb.ai's default API base. The key rides the `x-api-key` header.
 pub const CAMB_API_BASE: &str = "https://client.camb.ai";
@@ -43,9 +47,13 @@ pub struct CambTts {
 
 impl CambTts {
     /// Construct bound to `api_key` + `voice_id` (default model `mars-instruct`,
-    /// language `en-us`, 22050 Hz `pcm_s16le`). Camb requires a region-coded language
+    /// language `en-us`, 48000 Hz `pcm_s16le`). Camb requires a region-coded language
     /// (`en-us`/`en-au`/… — bare `en` is rejected with a 422); override via
     /// [`language`](Self::language).
+    ///
+    /// Camb **ignores** the requested `sample_rate` and always streams its native
+    /// 48 kHz, so we tag the PCM at 48 kHz (declaring anything else plays the audio
+    /// at the wrong speed/pitch).
     pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
         Self {
             client: HttpTtsClient::new("camb"),
@@ -54,7 +62,7 @@ impl CambTts {
             voice_id: voice_id.into(),
             language: "en-us".to_string(),
             model: "mars-instruct".to_string(),
-            sample_rate: 24_000,
+            sample_rate: 48_000,
             ctx_counter: 0,
         }
     }
@@ -71,7 +79,9 @@ impl CambTts {
         self
     }
 
-    /// Override the output sample rate (default 22050 Hz).
+    /// Override the output sample rate (default 48000 Hz). Note Camb ignores this
+    /// over the wire and always returns 48 kHz, so changing it only mis-tags the
+    /// PCM — kept for API uniformity.
     pub fn with_sample_rate(mut self, rate: u32) -> Self {
         self.sample_rate = rate;
         self
@@ -115,7 +125,7 @@ impl TtsService for CambTts {
         };
         let raw = self.client.post(req).await?;
         Ok(tts_frames(
-            pcm_from_le_bytes(&raw),
+            pcm_from_le_bytes(strip_wav_header(&raw)),
             self.sample_rate,
             context_id,
         ))
@@ -123,8 +133,8 @@ impl TtsService for CambTts {
 }
 
 /// Build the Camb `/apis/tts-stream` request body (pure seam). The output
-/// `sample_rate` is requested explicitly so Camb's stream matches the rate we tag
-/// the PCM with (otherwise Camb picks its own and the audio plays at the wrong rate).
+/// `sample_rate` is still sent for completeness, but Camb ignores it and always
+/// streams its native 48 kHz `pcm_s16le` — the caller must tag the PCM at 48 kHz.
 pub fn build_body(
     text: &str,
     voice_id: &str,
@@ -143,7 +153,7 @@ pub fn build_body(
         "voice_id": voice,
         "language": language,
         "speech_model": model,
-        "output_configuration": { "format": "pcm_s16le", "sample_rate": sample_rate },
+        "output_configuration": { "format": "wav", "sample_rate": sample_rate },
     })
 }
 
@@ -159,7 +169,7 @@ mod tests {
         assert_eq!(body["language"], "en");
         assert_eq!(body["output_configuration"]["sample_rate"], 24_000);
         assert_eq!(body["speech_model"], "mars-instruct");
-        assert_eq!(body["output_configuration"]["format"], "pcm_s16le");
+        assert_eq!(body["output_configuration"]["format"], "wav");
     }
 
     #[test]
@@ -177,7 +187,8 @@ mod tests {
     fn client_defaults() {
         let tts = CambTts::new("k", "v-42");
         assert_eq!(tts.name(), "camb");
-        assert_eq!(tts.sample_rate(), 24_000);
+        assert_eq!(tts.sample_rate(), 48_000); // Camb's fixed native rate
+
         assert_eq!(tts.url(), "https://client.camb.ai/apis/tts-stream");
     }
 
