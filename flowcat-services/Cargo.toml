@@ -56,7 +56,7 @@ stt-fal           = ["stt-openai"]                                          # (W
 stt-speaches      = ["stt-openai"]                                          # (W) Whisper-HTTP
 stt-xai           = ["stt-openai"]                                          # (W) Whisper-HTTP
 stt-google        = ["dep:tonic", "dep:tokio", "dep:bytes", "dep:http", "tonic/channel", "tonic/tls-aws-lc", "tonic/tls-webpki-roots"]  # (D) gRPC bidi (live transport)
-stt-nvidia        = ["dep:tonic", "dep:tokio"]                             # (D) gRPC (Riva)
+stt-nvidia        = ["dep:tonic", "dep:tokio", "dep:bytes", "dep:http", "tonic/channel", "tonic/tls-aws-lc", "tonic/tls-webpki-roots"]  # (D) gRPC bidi (live transport)
 stt-aws-transcribe = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio", "dep:hmac", "dep:sha2"]  # (D) SigV4 WS
 stt-whisper-local = ["dep:whisper-rs"]                                      # (D) local (C build: cmake)
 # tts — see PROVIDERS.md §3. Streaming-WS carry tokio-tungstenite +

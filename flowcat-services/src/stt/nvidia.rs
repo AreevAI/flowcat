@@ -28,12 +28,26 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::{Buf, BufMut};
+use futures::stream::{self, StreamExt};
+use http::uri::PathAndQuery;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tonic::client::Grpc;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::metadata::MetadataValue;
+use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::{Request, Status};
 
 use flowcat_core::error::{FlowcatError, Result};
 use flowcat_core::processor::frame::{AudioFrame, Frame, StartParams};
 use flowcat_core::service::SttService;
 
 use grpc_proto::Field;
+
+/// NVIDIA NIM's hosted Riva ASR gRPC host (NVCF). A self-hosted Riva server can be
+/// targeted with [`NvidiaStt::endpoint`].
+pub const NVIDIA_NVCF_HOST: &str = "grpc.nvcf.nvidia.com";
 
 /// Minimal hand-rolled protobuf (wire) + gRPC length-prefix framing for the Riva
 /// `StreamingRecognize` messages — **no `prost`** (tonic 0.14 core does not pull it;
@@ -198,11 +212,38 @@ pub const STREAMING_RECOGNIZE_PATH: &str =
 /// `AudioEncoding.LINEAR_PCM` (16-bit LE PCM) in `riva_audio.proto`.
 const AUDIO_ENCODING_LINEAR_PCM: i64 = 1;
 
+/// End-of-utterance gap: NVCF parakeet streams cumulative interims and (in practice)
+/// no `is_final`, so once an interim exists this much further audio with no new
+/// interim closes the user turn (one final transcript).
+const TURN_GAP_MS: u64 = 700;
+
+/// Live gRPC bidi connection state (present once [`SttService::start`] succeeds).
+struct Connection {
+    /// Sender into the outbound request stream; `run_stt` pushes encoded audio here.
+    /// Dropping it half-closes the request stream (clean teardown).
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Transcription frames the reader task has decoded so far (drained non-blocking).
+    frames: mpsc::UnboundedReceiver<Frame>,
+    /// The response-reader task; aborted on drop.
+    reader: JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 /// NVIDIA Riva / Nemotron Speech streaming-STT service.
 pub struct NvidiaStt {
     /// API key for NIM-hosted Riva (`function-id`/bearer). Empty for a self-hosted
     /// Riva server that needs no auth.
     api_key: String,
+    /// gRPC host (default NVCF; a self-hosted Riva sets its own host).
+    host: String,
+    /// NVCF function id — the hosted ASR model to route to (NVCF only; empty for a
+    /// self-hosted Riva, which has no function routing).
+    function_id: String,
     /// BCP-47 language code (e.g. `en-US`).
     language_code: String,
     /// ASR model name (e.g. `parakeet-1.1b-en-US-asr-streaming`); empty ⇒ server
@@ -211,21 +252,47 @@ pub struct NvidiaStt {
     sample_rate: u32,
     interim_results: bool,
     muted: bool,
+    /// Live bidi connection — `None` until `start` opens it.
+    conn: Option<Connection>,
+    /// Latest cumulative interim text of the in-progress turn (Riva interims replace,
+    /// not append). Emitted as the turn-final once transcription goes quiet.
+    turn_text: String,
+    /// Audio ms since the last new interim — the end-of-utterance clock.
+    quiet_ms: u64,
 }
 
 impl NvidiaStt {
-    /// Construct bound to `api_key` (default `en-US`, server-default model, 16 kHz,
-    /// interim results on). Pass an empty key for an unauthenticated self-hosted
-    /// Riva.
+    /// Construct bound to `api_key` (default NVCF host, `en-US`, server-default model,
+    /// 16 kHz, interim results on). Pass an empty key for an unauthenticated
+    /// self-hosted Riva.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            host: NVIDIA_NVCF_HOST.to_string(),
+            function_id: String::new(),
             language_code: "en-US".to_string(),
             model: String::new(),
             sample_rate: 16_000,
             interim_results: true,
             muted: false,
+            conn: None,
+            turn_text: String::new(),
+            quiet_ms: 0,
         }
+    }
+
+    /// Override the gRPC host (default `grpc.nvcf.nvidia.com`; set for a self-hosted
+    /// Riva server, e.g. `localhost:50051`).
+    pub fn endpoint(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
+        self
+    }
+
+    /// Set the NVCF `function-id` (the hosted ASR model to route to). Required for
+    /// NIM-hosted Riva; leave empty for a self-hosted server.
+    pub fn function_id(mut self, id: impl Into<String>) -> Self {
+        self.function_id = id.into();
+        self
     }
 
     /// Override the language code (default `en-US`).
@@ -253,17 +320,71 @@ impl NvidiaStt {
     }
 
     /// gRPC request metadata. NIM-hosted Riva authenticates with an
-    /// `authorization: Bearer <key>` header; a self-hosted server with no key gets
-    /// no auth metadata. Returned as `(name, value)` pairs.
+    /// `authorization: Bearer <key>` header **and** a `function-id` routing the call
+    /// to the chosen ASR model; a self-hosted server with no key gets neither.
+    /// Returned as `(name, value)` pairs.
     pub fn auth_metadata(&self) -> Vec<(String, String)> {
-        if self.api_key.is_empty() {
-            vec![]
-        } else {
-            vec![(
+        let mut md = Vec::new();
+        if !self.api_key.is_empty() {
+            md.push((
                 "authorization".to_string(),
                 format!("Bearer {}", self.api_key),
-            )]
+            ));
         }
+        if !self.function_id.is_empty() {
+            md.push(("function-id".to_string(), self.function_id.clone()));
+        }
+        md
+    }
+}
+
+/// Raw-bytes [`tonic::codec::Codec`]: messages ARE the already-encoded
+/// `StreamingRecognizeRequest` bytes ([`encode_config_request`]/[`encode_audio_request`])
+/// and the raw `StreamingRecognizeResponse` bytes handed to [`decode_response`]. tonic
+/// owns the gRPC length-prefix framing, so the pure encode/decode fns are reused over
+/// the live stream verbatim. (Mirrors the Google STT codec — the two share the wire.)
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RivaCodec;
+
+impl Codec for RivaCodec {
+    type Encode = Vec<u8>;
+    type Decode = Vec<u8>;
+    type Encoder = RawEncoder;
+    type Decoder = RawDecoder;
+    fn encoder(&mut self) -> RawEncoder {
+        RawEncoder
+    }
+    fn decoder(&mut self) -> RawDecoder {
+        RawDecoder
+    }
+}
+
+pub(crate) struct RawEncoder;
+impl Encoder for RawEncoder {
+    type Item = Vec<u8>;
+    type Error = Status;
+    fn encode(
+        &mut self,
+        item: Vec<u8>,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), Status> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+pub(crate) struct RawDecoder;
+impl Decoder for RawDecoder {
+    type Item = Vec<u8>;
+    type Error = Status;
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> std::result::Result<Option<Vec<u8>>, Status> {
+        let n = src.remaining();
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut v = vec![0u8; n];
+        src.copy_to_slice(&mut v);
+        Ok(Some(v))
     }
 }
 
@@ -346,35 +467,173 @@ impl SttService for NvidiaStt {
     }
 
     async fn start(&mut self, _params: &StartParams) -> Result<()> {
-        // Wire/auth seam complete; the live bidi transport needs tonic's `channel`
-        // + TLS (Cargo.toml-gated — see module docs). Build the config request +
-        // auth so the failure is explicit, not silent.
-        let _initial = encode_config_request(
+        // The gRPC dial + bidi stream run in a **background task**: NVCF cold-starts
+        // can take many seconds, and doing it inline (in `start` or `run_stt`) would
+        // stall the pipeline. `run_stt` just queues audio (buffered until the stream
+        // is up) and drains decoded frames.
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Frame>();
+        let config_req = encode_config_request(
             &self.language_code,
             &self.model,
             self.sample_rate,
             self.interim_results,
         );
-        let _auth = self.auth_metadata();
-        Err(FlowcatError::Network(
-            "nvidia Riva STT: transport not fully wired — needs tonic `channel` + \
-             TLS feature (Cargo.toml-gated); wire/auth seam ready"
-                .into(),
-        ))
+        let host = self.host.clone();
+        let metadata = self.auth_metadata();
+        let reader = tokio::spawn(async move {
+            if let Err(e) = run_session(host, metadata, config_req, audio_rx, frame_tx).await {
+                tracing::error!(target: "flowcat_services::stt", error = %e, "nvidia STT session ended");
+            }
+        });
+        self.conn = Some(Connection {
+            audio_tx,
+            frames: frame_rx,
+            reader,
+        });
+        Ok(())
     }
 
-    async fn run_stt(&mut self, _audio: Arc<AudioFrame>) -> Result<Vec<Frame>> {
+    async fn run_stt(&mut self, audio: Arc<AudioFrame>) -> Result<Vec<Frame>> {
         if self.muted {
             return Ok(vec![]);
         }
-        Err(FlowcatError::Network(
-            "nvidia Riva STT: transport not fully wired (see start)".into(),
-        ))
+        let chunk_ms = if audio.sample_rate > 0 {
+            (audio.pcm.len() as u64 * 1000) / audio.sample_rate as u64
+        } else {
+            0
+        };
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| FlowcatError::Network("nvidia STT: run_stt before start".into()))?;
+        // PCM i16 → little-endian bytes (the LINEAR_PCM wire format Riva expects).
+        let mut pcm_le = Vec::with_capacity(audio.pcm.len() * 2);
+        for s in &audio.pcm {
+            pcm_le.extend_from_slice(&s.to_le_bytes());
+        }
+        // Buffered: queues during NVCF cold-start, flushed once the stream is up.
+        let _ = conn.audio_tx.send(encode_audio_request(&pcm_le));
+
+        // Drain decoded results. Riva interims are cumulative (full hypothesis each
+        // time), so the latest replaces `turn_text`; a real `is_final` (rare on NVCF)
+        // closes the turn immediately.
+        let mut got_interim = false;
+        let mut finals = Vec::new();
+        while let Ok(f) = conn.frames.try_recv() {
+            match f {
+                Frame::InterimTranscription { text, .. } => {
+                    if !text.trim().is_empty() {
+                        self.turn_text = text;
+                        got_interim = true;
+                    }
+                }
+                Frame::Transcription { .. } => {
+                    self.turn_text.clear();
+                    self.quiet_ms = 0;
+                    finals.push(f);
+                }
+                other => finals.push(other),
+            }
+        }
+        if !finals.is_empty() {
+            return Ok(finals);
+        }
+        if got_interim {
+            self.quiet_ms = 0;
+        } else {
+            self.quiet_ms = self.quiet_ms.saturating_add(chunk_ms);
+        }
+        // End of utterance: an interim exists and transcription has gone quiet —
+        // emit the latest hypothesis as the single turn-final.
+        if !self.turn_text.is_empty() && self.quiet_ms >= TURN_GAP_MS {
+            let text = std::mem::take(&mut self.turn_text);
+            self.quiet_ms = 0;
+            return Ok(vec![Frame::Transcription {
+                text,
+                user_id: Arc::from("user"),
+                language: None,
+                final_: true,
+            }]);
+        }
+        Ok(vec![])
     }
 
     async fn set_muted(&mut self, muted: bool) {
+        // Bot speaking / turn closed: drop any half-turn remainder so the next user
+        // turn starts clean.
+        if muted {
+            self.turn_text.clear();
+            self.quiet_ms = 0;
+        }
         self.muted = muted;
     }
+}
+
+/// Background session: TLS-dial the gRPC host, open the bidi `StreamingRecognize`
+/// stream (config request first, then the buffered audio chunks), and forward every
+/// decoded `StreamingRecognizeResponse` as transcription [`Frame`]s to `frame_tx`.
+/// Runs for the life of the call; ends on stream close/error.
+async fn run_session(
+    host: String,
+    metadata: Vec<(String, String)>,
+    config_req: Vec<u8>,
+    audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    frame_tx: mpsc::UnboundedSender<Frame>,
+) -> Result<()> {
+    let tls = ClientTlsConfig::new()
+        .domain_name(host.clone())
+        .with_webpki_roots();
+    let endpoint = Endpoint::from_shared(format!("https://{host}"))
+        .map_err(|e| FlowcatError::Network(format!("nvidia endpoint: {e}")))?
+        .tls_config(tls)
+        .map_err(|e| FlowcatError::Network(format!("nvidia tls: {e}")))?;
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| FlowcatError::Network(format!("nvidia connect: {e}")))?;
+
+    let audio_stream = stream::unfold(audio_rx, |mut rx| async move {
+        rx.recv().await.map(|m| (m, rx))
+    });
+    let out_stream = stream::once(async move { config_req }).chain(audio_stream);
+
+    let mut request = Request::new(out_stream);
+    for (name, value) in metadata {
+        let key: tonic::metadata::MetadataKey<_> = name
+            .parse()
+            .map_err(|e| FlowcatError::Network(format!("nvidia metadata key: {e}")))?;
+        let val: MetadataValue<_> = value
+            .parse()
+            .map_err(|e| FlowcatError::Network(format!("nvidia metadata value: {e}")))?;
+        request.metadata_mut().insert(key, val);
+    }
+
+    let path = PathAndQuery::from_static(STREAMING_RECOGNIZE_PATH);
+    let mut grpc = Grpc::new(channel);
+    grpc.ready()
+        .await
+        .map_err(|e| FlowcatError::Network(format!("nvidia grpc not ready: {e}")))?;
+    let response = grpc
+        .streaming(request, path, RivaCodec)
+        .await
+        .map_err(|e| FlowcatError::Network(format!("nvidia streaming: {e}")))?;
+
+    let mut inbound = response.into_inner();
+    loop {
+        match inbound.message().await {
+            Ok(Some(bytes)) => {
+                for frame in decode_response(&bytes) {
+                    if frame_tx.send(frame).is_err() {
+                        return Ok(()); // consumer gone
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Err(FlowcatError::Network(format!("nvidia stream: {status}"))),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,21 +725,29 @@ mod tests {
         assert!(unkeyed.auth_metadata().is_empty());
     }
 
-    #[tokio::test]
-    async fn start_reports_transport_seam_clearly() {
-        let mut stt = NvidiaStt::new("k");
-        let err = stt.start(&StartParams::default()).await.unwrap_err();
-        assert!(err.to_string().contains("not fully wired"));
+    #[test]
+    fn auth_metadata_carries_bearer_and_function_id() {
+        let stt = NvidiaStt::new("k").function_id("fn-123");
+        let md = stt.auth_metadata();
+        assert!(md
+            .iter()
+            .any(|(n, v)| n == "authorization" && v == "Bearer k"));
+        assert!(md.iter().any(|(n, v)| n == "function-id" && v == "fn-123"));
+        // Self-hosted (no key, no function) → no metadata.
+        assert!(NvidiaStt::new("").auth_metadata().is_empty());
     }
 
-    /// Live smoke (requires `NVIDIA_API_KEY` + the tonic transport feature). Ignored
-    /// until the transport is wired. Run with:
-    /// `NVIDIA_API_KEY=… cargo test -p flowcat-services --features stt-nvidia -- --ignored nvidia_live`
+    /// Live smoke (requires `NVIDIA_API_KEY` + a NIM ASR `NVIDIA_FUNCTION_ID`). Run:
+    /// `NVIDIA_API_KEY=… NVIDIA_FUNCTION_ID=… cargo test -p flowcat-services \
+    ///   --features stt-nvidia -- --ignored nvidia_live`
     #[tokio::test]
-    #[ignore = "transport not wired (needs tonic channel+TLS) + NVIDIA_API_KEY"]
+    #[ignore = "requires NVIDIA_API_KEY + NVIDIA_FUNCTION_ID (NVCF ASR)"]
     async fn nvidia_live_connects_and_streams() {
         let key = std::env::var("NVIDIA_API_KEY").expect("NVIDIA_API_KEY");
-        let mut stt = NvidiaStt::new(key);
-        let _ = stt.start(&StartParams::default()).await;
+        let function_id = std::env::var("NVIDIA_FUNCTION_ID").expect("NVIDIA_FUNCTION_ID");
+        let mut stt = NvidiaStt::new(key).function_id(function_id);
+        stt.start(&StartParams::default()).await.expect("start");
+        let silence = Arc::new(AudioFrame::mono(vec![0i16; 1600], 16_000));
+        let _ = stt.run_stt(silence).await.expect("run_stt");
     }
 }
