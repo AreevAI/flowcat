@@ -70,3 +70,12 @@ jobs:
         run: |
           cargo clippy -p flowcat-server --locked --features webrtc --all-targets -- -D warnings
           cargo test -p flowcat-server --locked --features webrtc
+      # Guard the embedder seam (#30): the framework + WebRTC helper surface
+      # (`webrtc::handle_offer`, `build_router`) MUST compile with NO
+      # `flowcat-services/*-all` bundle, so an embedder can pair it with its own
+      # curated connector set. If this breaks, the framework grew a hard connector
+      # dependency it shouldn't have.
+      - name: flowcat-server (webrtc-helper — no connector bundles)
+        run: |
+          cargo clippy -p flowcat-server --locked --features webrtc-helper --all-targets -- -D warnings
+          cargo test -p flowcat-server --locked --features webrtc-helper

@@ -11,25 +11,47 @@ categories.workspace = true
 
 [features]
 default = []
-# The HTTP server binary (axum) + the providers it can run. Pulls the runtime
-# deps and enables the full flowcat-services connector set so the binary can run
-# any provider named in the config. The default (no-feature) build is just the
-# library: the config schema + StaticSession + the run-orchestration helpers.
-server = [
+# --- Framework surface (no bundled connectors) ----------------------------------
+# `server-helper` is the axum HTTP/transport framework — `build_router`, `AppState`,
+# the Plivo media WS, the `run_call*` orchestration — generic over the embedder's
+# `SessionSource` + `AgentBrain`, WITHOUT forcing any `flowcat-services/*-all`
+# bundle. An embedder enables this plus its OWN curated `flowcat-services/*`
+# connector features (which unify into the shared factory). It pulls only the
+# runtime deps the framework itself needs.
+server-helper = [
     "dep:axum",
     "dep:tokio",
     "dep:futures-util",
     "dep:tracing-subscriber",
     "dep:flowcat-agent",
     "dep:flowcat-telephony",
+]
+# `server-helper` + the browser WebRTC playground surface: the page, the SDP-offer
+# endpoint (`webrtc::offer` / the reusable `webrtc::handle_offer` signaling helper)
+# over a str0m transport, and the live-events WS — still WITHOUT any connector
+# bundle. This is what an embedder enables to reuse `handle_offer` with its own
+# `flowcat-services/*` selection (issue #30).
+webrtc-helper = [
+    "server-helper",
+    "dep:flowcat-transports",
+    "flowcat-transports/webrtc-str0m",
+]
+
+# --- Standalone binary (framework + every connector bundle) ----------------------
+# The HTTP server binary (axum): `server-helper` plus the full flowcat-services
+# connector set, so the binary can run any provider named in a config. The default
+# (no-feature) build is just the library: the config schema + StaticSession + the
+# run-orchestration helpers.
+server = [
+    "server-helper",
     "flowcat-services/stt-all",
     "flowcat-services/tts-all",
     "flowcat-services/llm-all",
     "flowcat-services/realtime-all",
 ]
-# The browser WebRTC playground: the page, the SDP-offer endpoint over a str0m
-# transport, and the live-events WebSocket. Implies `server`.
-webrtc = ["server", "dep:flowcat-transports", "flowcat-transports/webrtc-str0m"]
+# The full browser WebRTC playground binary: the `webrtc-helper` surface plus the
+# complete `server` connector set. (`webrtc-helper` + `server`.)
+webrtc = ["webrtc-helper", "server"]
 
 [dependencies]
 flowcat-core = { path = "../flowcat-core", version = "0.1.0" }

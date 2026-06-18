@@ -11,14 +11,20 @@
 //! - [`run`] — assemble + run the flowcat pipeline for one call from the config
 //!   topology (realtime or cascaded), resolving provider keys from the env.
 //!
-//! With the `server` Cargo feature, the crate also builds the **binary**: an axum
-//! HTTP server (health, the Plivo media WebSocket, the Plivo answer XML) that runs
-//! the configured agent. The default (no-feature) build is library-only and pulls
-//! no axum/tokio.
+//! The axum HTTP/transport framework — `build_router`, `AppState`, the media WS, and
+//! (with WebRTC) the reusable [`webrtc::handle_offer`] signaling helper — is gated
+//! behind the **`server-helper`** feature; the browser playground surface adds
+//! **`webrtc-helper`**. Neither helper pulls a `flowcat-services/*-all` bundle, so an
+//! embedder reuses this surface with its OWN curated connector set (the factory
+//! unifies in whatever `flowcat-services/*` features the embedder enables). The
+//! standalone **binary** is built by the **`server`** feature (`server-helper` + every
+//! connector bundle) — or **`webrtc`** (`webrtc-helper` + `server`) for the full
+//! browser playground binary. The default (no-feature) build is library-only and
+//! pulls no axum/tokio.
 //!
 //! ## A reusable framework, not just a binary
 //!
-//! With the `server` feature, the HTTP/transport surface (`build_router` over
+//! With the `server-helper` feature, the HTTP/transport surface (`build_router` over
 //! `AppState`) is **generic over the embedder's `SessionSource` and `AgentBrain`**.
 //! The zero-config default (a [`StaticSession`] resolving one configured agent plus
 //! a `DeclarativeBrain` factory) is built by `AppState::new` and powers the
@@ -31,22 +37,22 @@ pub mod config;
 pub mod run;
 pub mod session;
 
-#[cfg(feature = "server")]
+#[cfg(feature = "server-helper")]
 pub mod server;
-#[cfg(feature = "server")]
+#[cfg(feature = "server-helper")]
 pub mod socket;
 
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "webrtc-helper")]
 pub mod events;
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "webrtc-helper")]
 pub mod webrtc;
 
 pub use config::{ConfigError, ServerConfig, TopologyConfig};
 pub use run::{env_spec_resolver, run_call, run_call_with, SpecResolver};
 pub use session::StaticSession;
 
-#[cfg(feature = "server")]
+#[cfg(feature = "server-helper")]
 pub use server::{build_router, AppState, BrainFactory};
 
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "webrtc-helper")]
 pub use webrtc::{handle_offer, OfferParams};

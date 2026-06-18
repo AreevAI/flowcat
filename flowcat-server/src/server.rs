@@ -53,14 +53,14 @@ pub struct AppState<S, B> {
     pub(crate) spec_resolver: SpecResolver,
     pub(crate) public_url: Arc<Option<String>>,
     /// Per-call live-event channels for the WebRTC playground.
-    #[cfg(feature = "webrtc")]
+    #[cfg(feature = "webrtc-helper")]
     pub(crate) events: Arc<crate::events::EventRegistry>,
     /// Monotonic per-call id source (`pc-<n>`).
-    #[cfg(feature = "webrtc")]
+    #[cfg(feature = "webrtc-helper")]
     pub(crate) next_pc: Arc<std::sync::atomic::AtomicU64>,
     /// Concrete IPv4 the str0m media socket binds (str0m rejects 0.0.0.0); from
     /// `FLOWCAT_WEBRTC_BIND_IP`, default loopback.
-    #[cfg(feature = "webrtc")]
+    #[cfg(feature = "webrtc-helper")]
     pub(crate) webrtc_bind_ip: std::net::Ipv4Addr,
 }
 
@@ -74,11 +74,11 @@ impl<S, B> Clone for AppState<S, B> {
             topology: Arc::clone(&self.topology),
             spec_resolver: Arc::clone(&self.spec_resolver),
             public_url: Arc::clone(&self.public_url),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             events: Arc::clone(&self.events),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             next_pc: Arc::clone(&self.next_pc),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             webrtc_bind_ip: self.webrtc_bind_ip,
         }
     }
@@ -103,11 +103,11 @@ impl<S, B> AppState<S, B> {
             // convention). An embedder swaps in its own via `with_spec_resolver`.
             spec_resolver: Arc::new(run::env_spec_resolver),
             public_url: Arc::new(public_url),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             events: Arc::new(crate::events::EventRegistry::new()),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             next_pc: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            #[cfg(feature = "webrtc")]
+            #[cfg(feature = "webrtc-helper")]
             webrtc_bind_ip: webrtc_bind_ip_from_env(),
         }
     }
@@ -144,7 +144,7 @@ impl AppState<StaticSession, DeclarativeBrain> {
 
 /// Resolve the WebRTC media bind IP from `FLOWCAT_WEBRTC_BIND_IP` (default
 /// `127.0.0.1`; str0m advertises it as the host ICE candidate and rejects 0.0.0.0).
-#[cfg(feature = "webrtc")]
+#[cfg(feature = "webrtc-helper")]
 fn webrtc_bind_ip_from_env() -> std::net::Ipv4Addr {
     std::env::var("FLOWCAT_WEBRTC_BIND_IP")
         .ok()
@@ -171,7 +171,7 @@ where
             get(answer_plivo::<S, B>),
         );
     // The browser playground (page + WebRTC offer + live-events WS).
-    #[cfg(feature = "webrtc")]
+    #[cfg(feature = "webrtc-helper")]
     let router = router
         .route("/", get(crate::webrtc::playground_page))
         .route(
