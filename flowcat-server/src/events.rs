@@ -12,6 +12,19 @@
 //! The channel is an **unbounded mpsc** whose receiver exists from
 //! [`EventRegistry::register`] (called BEFORE the SDP answer is returned), so events
 //! published before the browser subscribes are **buffered, not lost**.
+//!
+//! ## Serving the events from your own route
+//!
+//! [`events_ws`] is the standalone-server convenience: it is generic over
+//! flowcat-server's own [`AppState`] and carries no auth gate. An embedder that runs
+//! its own axum router with its own state and an auth check on the events endpoint
+//! reuses the receiver half directly — [`EventRegistry::take_receiver`] drains the
+//! per-call channel and [`stream_events`] pumps it to a socket — so its handler is
+//! `stream_events(socket, registry.take_receiver(pc_id)?)` behind its own gate, with
+//! no need to adopt the un-gated route or reimplement the registry. This mirrors how
+//! [`run_call_with`](crate::run::run_call_with) /
+//! [`handle_offer`](crate::webrtc::handle_offer) are consumable by an embedder
+//! bringing its own router + state.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,7 +42,8 @@ use flowcat_core::{AgentBrain, SessionSource};
 
 use crate::server::AppState;
 
-/// One call's event channel: the single consumer `rx` (taken once by [`events_ws`]).
+/// One call's event channel: the single consumer `rx`, taken once via
+/// [`EventRegistry::take_receiver`] (by [`events_ws`] or an embedder's own handler).
 struct CallChannel {
     rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
 }
@@ -64,9 +78,14 @@ impl EventRegistry {
         )
     }
 
-    /// Take the single consumer receiver for `pc_id` (once). `None` if no such call
+    /// Take the single consumer receiver for `pc_id` (once); `None` if no such call
     /// or it was already taken.
-    fn take_receiver(&self, pc_id: &str) -> Option<mpsc::UnboundedReceiver<String>> {
+    ///
+    /// This is the receiver half an embedder serving the live events over its **own**
+    /// (e.g. auth-gated) WebSocket route needs: pair it with [`stream_events`] —
+    /// `stream_events(socket, registry.take_receiver(pc_id)?)` — behind its own gate.
+    /// flowcat-server's own [`events_ws`] uses it the same way.
+    pub fn take_receiver(&self, pc_id: &str) -> Option<mpsc::UnboundedReceiver<String>> {
         let calls = self.calls.lock().unwrap();
         let taken = calls.get(pc_id)?.rx.lock().unwrap().take();
         taken
@@ -165,7 +184,12 @@ where
     ws.on_upgrade(move |socket| stream_events(socket, rx))
 }
 
-async fn stream_events(mut socket: WebSocket, mut rx: mpsc::UnboundedReceiver<String>) {
+/// Pump a call's `rx` (from [`EventRegistry::take_receiver`]) to an open WebSocket
+/// until the channel closes (call ended) or the subscriber goes away. This is the
+/// generic channel → socket pump [`events_ws`] runs after the upgrade; an embedder
+/// serving the events from its own auth-gated route calls it the same way once it
+/// has upgraded its socket.
+pub async fn stream_events(mut socket: WebSocket, mut rx: mpsc::UnboundedReceiver<String>) {
     while let Some(frame) = rx.recv().await {
         if socket.send(Message::Text(frame.into())).await.is_err() {
             break; // subscriber gone
@@ -202,6 +226,31 @@ mod tests {
         // Drop the guard → the call is deregistered.
         drop(guard);
         assert!(reg.take_receiver("pc-1").is_none());
+    }
+
+    #[test]
+    fn buffered_events_survive_until_an_embedder_drains_them() {
+        // The embedder seam (#32): register BEFORE the answer, publish opening
+        // markers, and only later take the receiver (as an auth-gated handler would,
+        // once a subscriber connects). The pre-subscribe events must still be there,
+        // in order — proving an embedder can `take_receiver` + `stream_events` from
+        // its own route without losing the subscribe-race buffer.
+        let reg = Arc::new(EventRegistry::new());
+        let (events, _guard) = reg.register("pc-7");
+        events.publish(
+            "rtf-user-transcription",
+            json!({ "text": "one", "final": true }),
+        );
+        events.publish("rtf-bot-text", json!({ "text": "two" }));
+
+        // The embedder's gated handler drains via the now-public receiver half.
+        let mut rx = reg.take_receiver("pc-7").expect("receiver");
+        let first = rx.try_recv().expect("buffered frame 1");
+        let second = rx.try_recv().expect("buffered frame 2");
+        assert!(first.contains("\"text\":\"one\""), "{first}");
+        assert!(second.contains("\"text\":\"two\""), "{second}");
+        // Single consumer: a second take yields nothing.
+        assert!(reg.take_receiver("pc-7").is_none());
     }
 
     #[test]
