@@ -32,6 +32,12 @@
 //! injects its own session and per-call `BrainFactory` via `AppState::with_parts`,
 //! reusing the same router, media WebSocket, and live-events WS with no fork of the
 //! axum bootstrap.
+//!
+//! For the **native SIP/RTP** path (no carrier WS), the [`sip`] module's
+//! `serve_sip_inbound` + `sip_originate` are the analogue of `media_ws` +
+//! `run_call_with`: the same `SessionSource` + `BrainFactory` + topology wiring drives
+//! the inbound-INVITE pump and the outbound originate over a `SipAgent`, with the
+//! dialed-identifier→run mapping behind the embedder's `SipInboundResolver`.
 
 pub mod config;
 pub mod run;
@@ -39,6 +45,8 @@ pub mod session;
 
 #[cfg(feature = "server-helper")]
 pub mod server;
+#[cfg(feature = "server-helper")]
+pub mod sip;
 #[cfg(feature = "server-helper")]
 pub mod socket;
 
@@ -54,5 +62,17 @@ pub use session::StaticSession;
 #[cfg(feature = "server-helper")]
 pub use server::{build_router, AppState, BrainFactory};
 
+// The generic SIP inbound/originate orchestration — the SIP analogue of the
+// carrier media-WS path (`media_ws` + `run_call_with`).
+#[cfg(feature = "server-helper")]
+pub use sip::{serve_sip_inbound, sip_originate, SipInboundResolver, SipOrchestrator, SipRun};
+
 #[cfg(feature = "webrtc-helper")]
 pub use webrtc::{handle_offer, OfferParams};
+
+// The live-events surface: the publish side (register/publish per call) plus the
+// receiver/stream half an embedder serving its OWN gated events WS needs
+// ([`EventRegistry::take_receiver`] + [`stream_events`]). flowcat-server's own
+// un-gated [`events::events_ws`] route stays the standalone-server convenience.
+#[cfg(feature = "webrtc-helper")]
+pub use events::{stream_events, CallEvents, EventRegistry, RegistryGuard, RtfSink};
