@@ -99,6 +99,15 @@ impl OpenAiResponsesLlm {
             }
         }
 
+        // The Responses API requires a non-empty `input`. The kickoff greeting sends
+        // only the system prompt (lifted into `instructions`), leaving `input` empty
+        // → 400 "One of input/previous_response_id/prompt/conversation_id must be
+        // provided". Inject a minimal user turn so the model produces the greeting
+        // (mirrors the google/gemini kickoff fix).
+        if input.is_empty() {
+            input.push(json!({ "role": "user", "content": "Hello" }));
+        }
+
         let mut body = json!({
             "model": self.model,
             "input": input,
@@ -108,9 +117,16 @@ impl OpenAiResponsesLlm {
             body["instructions"] = Value::String(instructions);
         }
         // Tools: prefer the context's, else the service-level set. Responses flattens
-        // each tool to `{ type:"function", name, description, parameters }`.
+        // each tool to `{ type:"function", name, description, parameters }`. `ctx.tools`
+        // are the brain's provider-agnostic `Tool` JSON (with a `params` field), so they
+        // MUST go through `tool_to_responses` too — sending them verbatim 400s with
+        // "Missing required parameter: 'tools[0].type'".
         let tools: Vec<Value> = if !ctx.tools.is_empty() {
-            ctx.tools.clone()
+            ctx.tools
+                .iter()
+                .filter_map(|t| serde_json::from_value::<Tool>(t.clone()).ok())
+                .map(|t| tool_to_responses(&t))
+                .collect()
         } else {
             self.tools.iter().map(tool_to_responses).collect()
         };
@@ -400,6 +416,44 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "end_call");
         assert!(body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn kickoff_system_only_injects_a_synthetic_user_turn() {
+        // The greeting kickoff sends only the system prompt; the Responses API
+        // rejects an empty `input` (400), so we inject a minimal user turn.
+        let llm = OpenAiResponsesLlm::new("k");
+        let ctx = LlmContext {
+            messages: vec![json!({"role": "system", "content": "you are a bot"})],
+            tools: vec![],
+        };
+        let body = llm.request_body(&ctx);
+        assert_eq!(body["instructions"], "you are a bot");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "input must be non-empty for the Responses API");
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn ctx_tools_are_flattened_to_the_responses_shape() {
+        // The brain passes per-node tools via `ctx.tools` as raw `Tool` JSON
+        // (`{name, description, params}`). They must be flattened to
+        // `{type:"function", name, description, parameters}`, not sent verbatim
+        // (verbatim → 400 "Missing required parameter: 'tools[0].type'").
+        let llm = OpenAiResponsesLlm::new("k");
+        let ctx = LlmContext {
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            tools: vec![json!({
+                "name": "book_appointment",
+                "description": "book it",
+                "params": {"type": "object"}
+            })],
+        };
+        let body = llm.request_body(&ctx);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "book_appointment");
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+        assert!(body["tools"][0].get("function").is_none(), "Responses uses a flat shape");
     }
 
     #[test]

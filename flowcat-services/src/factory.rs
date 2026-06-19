@@ -221,6 +221,38 @@ pub fn stt(spec: &ProviderSpec) -> Result<Box<dyn SttService>, FlowcatError> {
             let recognizer = format!("projects/{project}/locations/{location}/recognizers/_");
             Ok(Box::new(crate::stt::GoogleStt::new(key, recognizer)))
         }
+        #[cfg(feature = "stt-nvidia")]
+        "nvidia" => {
+            // NVIDIA Riva ASR over gRPC. `key` = the NVCF bearer / NIM key; the
+            // `function_id` option routes to a hosted ASR model (NVCF only — empty
+            // for a self-hosted Riva, which sets its own `host`). `model` is optional.
+            let mut c = crate::stt::NvidiaStt::new(key);
+            let function_id = spec.opt("function_id");
+            if !function_id.is_empty() {
+                c = c.function_id(function_id);
+            }
+            let host = spec.opt("host");
+            if !host.is_empty() {
+                c = c.endpoint(host);
+            }
+            if !spec.model.is_empty() {
+                c = c.model(&spec.model);
+            }
+            Ok(Box::new(c))
+        }
+        #[cfg(feature = "stt-whisper-local")]
+        "whisper_local" => {
+            // Local whisper.cpp (in-process, no network). `model_path` is required —
+            // the path to a ggml model file (the key is an unused keyless placeholder).
+            let path = spec.opt("model_path");
+            if path.is_empty() {
+                return Err(FlowcatError::Session(
+                    "whisper_local stt requires the `model_path` option (path to a ggml model)"
+                        .to_string(),
+                ));
+            }
+            Ok(Box::new(crate::stt::WhisperLocalStt::new(path)))
+        }
         other => Err(not_built("stt", other)),
     }
 }
