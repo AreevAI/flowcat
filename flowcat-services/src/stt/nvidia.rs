@@ -588,20 +588,17 @@ async fn run_session(
         .map_err(|e| FlowcatError::Network(format!("nvidia endpoint: {e}")))?
         .tls_config(tls)
         .map_err(|e| FlowcatError::Network(format!("nvidia tls: {e}")))?;
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|e| {
-            // tonic's Display is just "transport error"; surface the source chain so
-            // a TLS / h2 / DNS / refused-connection cause is diagnosable.
-            let mut detail = format!("{e}");
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                detail.push_str(&format!(" → {s}"));
-                src = s.source();
-            }
-            FlowcatError::Network(format!("nvidia connect: {detail}"))
-        })?;
+    let channel = endpoint.connect().await.map_err(|e| {
+        // tonic's Display is just "transport error"; surface the source chain so
+        // a TLS / h2 / DNS / refused-connection cause is diagnosable.
+        let mut detail = format!("{e}");
+        let mut src = std::error::Error::source(&e);
+        while let Some(s) = src {
+            detail.push_str(&format!(" → {s}"));
+            src = s.source();
+        }
+        FlowcatError::Network(format!("nvidia connect: {detail}"))
+    })?;
 
     let audio_stream = stream::unfold(audio_rx, |mut rx| async move {
         rx.recv().await.map(|m| (m, rx))

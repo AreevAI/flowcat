@@ -430,7 +430,11 @@ mod tests {
         let body = llm.request_body(&ctx);
         assert_eq!(body["instructions"], "you are a bot");
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1, "input must be non-empty for the Responses API");
+        assert_eq!(
+            input.len(),
+            1,
+            "input must be non-empty for the Responses API"
+        );
         assert_eq!(input[0]["role"], "user");
     }
 
@@ -453,7 +457,10 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "book_appointment");
         assert_eq!(body["tools"][0]["parameters"]["type"], "object");
-        assert!(body["tools"][0].get("function").is_none(), "Responses uses a flat shape");
+        assert!(
+            body["tools"][0].get("function").is_none(),
+            "Responses uses a flat shape"
+        );
     }
 
     #[test]
