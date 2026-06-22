@@ -261,6 +261,7 @@ where
             session,
             run_id,
             token,
+            run::context_relay_from_env(),
             vec![],
         )
         .await;

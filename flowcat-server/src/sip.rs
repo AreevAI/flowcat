@@ -230,6 +230,7 @@ async fn handle_inbound_invite<S, B, R>(
         Arc::clone(&orchestrator.session),
         run_id,
         token,
+        run::context_relay_from_env(),
         vec![],
     )
     .await;
@@ -281,6 +282,7 @@ where
             Arc::clone(&orchestrator.session),
             run_id,
             token,
+            run::context_relay_from_env(),
             vec![],
         )
         .await;

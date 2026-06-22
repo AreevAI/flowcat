@@ -135,7 +135,15 @@ where
     tokio::spawn(async move {
         let _keepalive = keepalive; // held until call end (e.g. deregisters events)
         let res = run::run_call_with(
-            transport, &topology, &*resolver, brain, session, run_id, token, observers,
+            transport,
+            &topology,
+            &*resolver,
+            brain,
+            session,
+            run_id,
+            token,
+            run::context_relay_from_env(),
+            observers,
         )
         .await;
         match res {

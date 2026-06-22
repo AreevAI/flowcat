@@ -76,6 +76,21 @@ pub trait ContextCompactor: Send + Sync {
     async fn compact(&self, older: &[TranscriptLine], prior: Option<&str>) -> Option<String>;
 }
 
+/// A no-op [`ContextCompactor`] that never summarizes, so the digest carries the
+/// recent turns **verbatim**. Useful when no summarizer LLM is wired — the audio→text
+/// re-base still drops the expensive audio history — or to exercise the relay live
+/// without a second provider. Caveat: with no summary the verbatim tail grows over a
+/// very long call; wire a real summarizing [`ContextCompactor`] for unbounded-length
+/// calls.
+pub struct VerbatimCompactor;
+
+#[async_trait]
+impl ContextCompactor for VerbatimCompactor {
+    async fn compact(&self, _older: &[TranscriptLine], _prior: Option<&str>) -> Option<String> {
+        None
+    }
+}
+
 /// The running compacted representation of a conversation: a rolling `summary` of
 /// the turns up to [`summarized_through`](Self::summarized_through), with everything
 /// after it carried verbatim. Rendered into a delimited block appended to the base

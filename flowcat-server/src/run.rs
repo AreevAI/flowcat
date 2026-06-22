@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use flowcat_core::observer::FrameObserver;
-use flowcat_core::pipeline::CascadedConfig;
+use flowcat_core::pipeline::{CascadedConfig, ContextRelayConfig, VerbatimCompactor};
 use flowcat_core::{AgentBrain, FlowcatError, MediaTransport, SessionSource};
 use flowcat_services::factory::{self, ProviderSpec};
 
@@ -85,6 +85,43 @@ pub fn env_spec_resolver(spec: &ProviderSpec) -> Result<ProviderSpec, FlowcatErr
         s.api_key = key_from_env(&s.provider);
     }
     Ok(s)
+}
+
+/// Build an optional [`ContextRelayConfig`] from the environment — the opt-in for
+/// long-call context compaction on the **standalone server** (e.g. to exercise it
+/// over the WebRTC playground with no telephony setup). `FLOWCAT_CONTEXT_RELAY=1`
+/// turns it on with a verbatim (no-summary) compactor — the audio→text re-base still
+/// drops the expensive audio history; `FLOWCAT_CONTEXT_RELAY_MAX_TOKENS` and
+/// `FLOWCAT_CONTEXT_RELAY_MAX_SESSION_SECS` tune the budget / session-age triggers
+/// (the latter is handy for a quick demo: re-base after N seconds). Returns `None`
+/// when the flag is unset, so the pipeline is unchanged. Realtime/S2S only — the
+/// cascaded path ignores it.
+pub fn context_relay_from_env() -> Option<ContextRelayConfig> {
+    let enabled = std::env::var("FLOWCAT_CONTEXT_RELAY")
+        .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let mut cfg = ContextRelayConfig::new(Arc::new(VerbatimCompactor));
+    if let Some(n) = std::env::var("FLOWCAT_CONTEXT_RELAY_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        cfg.max_context_tokens = Some(n);
+    }
+    if let Some(n) = std::env::var("FLOWCAT_CONTEXT_RELAY_MAX_SESSION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        cfg.max_session_secs = Some(n);
+    }
+    tracing::info!(
+        max_context_tokens = ?cfg.max_context_tokens,
+        max_session_secs = ?cfg.max_session_secs,
+        "ContextRelay enabled (FLOWCAT_CONTEXT_RELAY)"
+    );
+    Some(cfg)
 }
 
 /// The provider specs a call runs with, after resolution — what the factory builds
@@ -163,6 +200,7 @@ where
         session,
         run_id,
         token,
+        context_relay_from_env(),
         observers,
     )
     .await
@@ -182,6 +220,7 @@ pub async fn run_call_with<T, B, S, R>(
     session: S,
     run_id: i64,
     token: String,
+    context_relay: Option<ContextRelayConfig>,
     observers: Vec<Arc<dyn FrameObserver>>,
 ) -> Result<(), FlowcatError>
 where
@@ -195,7 +234,15 @@ where
             let model = spec.model.clone();
             let realtime = factory::realtime(&spec)?;
             flowcat_core::pipeline::s2s::build_s2s_task_with_observers(
-                transport, realtime, brain, session, run_id, token, model, None, observers,
+                transport,
+                realtime,
+                brain,
+                session,
+                run_id,
+                token,
+                model,
+                context_relay,
+                observers,
             )
             .await?
             .run()
