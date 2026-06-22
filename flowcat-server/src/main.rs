@@ -18,6 +18,12 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
+    // Install a process-default rustls crypto provider before any TLS. The `webrtc`
+    // build links two providers (aws-lc-rs via str0m, ring via the realtime WS TLS),
+    // so rustls 0.23 can't auto-pick one and the realtime client's handshake would
+    // panic. `.ok()` — a no-op if one is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

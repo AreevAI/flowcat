@@ -973,6 +973,7 @@ dependencies = [
  "flowcat-telephony",
  "flowcat-transports",
  "futures-util",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -25,6 +25,7 @@ server-helper = [
     "dep:tracing-subscriber",
     "dep:flowcat-agent",
     "dep:flowcat-telephony",
+    "dep:rustls",
 ]
 # `server-helper` + the browser WebRTC playground surface: the page, the SDP-offer
 # endpoint (`webrtc::offer` / the reusable `webrtc::handle_offer` signaling helper)
@@ -75,6 +76,10 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 futures-util = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# The binary installs a process-default rustls crypto provider at startup: the
+# `webrtc` build links BOTH aws-lc-rs (str0m) and ring (realtime WS TLS), so rustls
+# 0.23 cannot auto-select one and the Gemini TLS handshake would panic.
+rustls = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
