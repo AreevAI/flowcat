@@ -52,7 +52,20 @@ infrastructure. For data-residency, on-prem, and sovereignty requirements
 (healthcare, finance, public sector), that's the deployment model itself — not a
 checkbox bolted onto a SaaS.
 
-### 2. pipecat-compatible by design
+### 2. Long-call memory — without the audio tax
+
+Realtime models re-bill the **whole conversation every turn** — as bulky, expensive
+audio — so the usual way to keep long calls affordable, sliding-window compression,
+saves money by **discarding the oldest turns** (your agent forgets the account number
+from minute one). Flowcat's **ContextRelay** converts that accumulated audio context
+into a compact text transcript and reseeds the session: the model re-attends cheap text
+(~7× smaller, ~4× cheaper per token) instead of audio, and the **whole conversation
+survives**. The live voice path is unchanged — the agent still speaks native audio; the
+trade-off is that converted turns carry their words, not their prosody. Off by default,
+provider-agnostic. See
+[the ContextRelay evaluation](docs/context-relay-evaluation.md).
+
+### 3. pipecat-compatible by design
 
 If you know [pipecat](https://github.com/pipecat-ai/pipecat), you already know
 Flowcat. It deliberately mirrors pipecat's architecture and public API model —
@@ -62,7 +75,7 @@ bring the same mental model and the **same vendor credentials**; you get a singl
 static Rust binary instead of a Python process tree. See
 [Connectors & providers](#connectors--providers).
 
-### 3. One process, room to scale
+### 4. One process, room to scale
 
 Because the media loop is Rust — no garbage collector, no GIL — one Flowcat
 process uses every core and holds a **flat p99 from 10 to 2,000 concurrent calls
@@ -74,7 +87,7 @@ that. What it guarantees is that *the runtime itself* never becomes the
 bottleneck or the source of a stall — so you provision fewer boxes and your tail
 stays predictable under load. See [Benchmark & capacity](#benchmark--capacity).
 
-### 4. Drive it from Python
+### 5. Drive it from Python
 
 You don't have to write Rust. Run Flowcat as a service and drive it from Python
 at **turn granularity**: implement your conversation policy as a small HTTP
@@ -311,13 +324,6 @@ The full feature-flag matrix is in [`FEATURES.md`](FEATURES.md); how the distinc
   FreeSWITCH/Asterisk at all. That's a *deployment choice, not a mandate* — if you
   already run a softswitch, keep it in front and feed audio over the WebSocket
   media transport. ([`SIP-DESIGN.md`](SIP-DESIGN.md).)
-- **Long-call memory that doesn't trade cost for context (opt-in).** Realtime models
-  re-bill the whole conversation every turn as expensive audio; the usual fix bounds that
-  cost by *evicting* the oldest turns — and forgetting them. On the speech-to-speech path,
-  `ContextRelay` instead *converts* the accumulated audio context into a compact text
-  transcript and reseeds the session — so the call stays cost-effective **and** the whole
-  conversation survives. Provider-agnostic; off by default.
-  ([`docs/context-relay-evaluation.md`](docs/context-relay-evaluation.md).)
 
 Design details: [`PROCESSOR-DESIGN.md`](PROCESSOR-DESIGN.md) (frozen API +
 latency argument) and [`DESIGN.md`](DESIGN.md) (runtime architecture + trait
