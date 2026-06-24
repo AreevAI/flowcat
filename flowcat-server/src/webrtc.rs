@@ -72,6 +72,16 @@ pub struct OfferParams<B, S, G> {
     /// IP (the SIP path's bind-UNSPECIFIED / advertise-public_ip pattern). `None`
     /// advertises the bound addr (the local default).
     pub advertise_ip: Option<Ipv4Addr>,
+    /// First UDP port to bind the media socket on. `0` = an OS-assigned **ephemeral**
+    /// port (the historical default — fine on a routable interface or behind a NAT
+    /// that forwards a wide range). When the host is behind a firewall that must open
+    /// a *known* port (cloud / GKE), set this to a fixed port and open that port (or
+    /// the `media_port_tries` range) on the firewall.
+    pub media_port_base: u16,
+    /// How many consecutive ports to try from `media_port_base` (one media socket is
+    /// bound per call, so this is the concurrent-call headroom of the pinned range).
+    /// Ignored when `media_port_base == 0`; `0`/`1` mean "only the base port".
+    pub media_port_tries: u16,
     /// Pipeline-facing carrier sample rate the str0m transport resamples to.
     pub carrier_rate: u32,
     /// Which providers to run + how their specs (keys) resolve.
@@ -116,6 +126,8 @@ where
         sdp,
         bind_ip,
         advertise_ip,
+        media_port_base,
+        media_port_tries,
         carrier_rate,
         topology,
         resolver,
@@ -127,10 +139,11 @@ where
         keepalive,
     } = params;
 
-    // Bind the media socket on the chosen interface (may be 0.0.0.0). An io error
-    // here is the caller's 5xx.
-    let bind = SocketAddr::new(IpAddr::V4(bind_ip), 0);
-    let socket = tokio::net::UdpSocket::bind(bind).await?;
+    // Bind the media socket on the chosen interface (may be 0.0.0.0). With
+    // `media_port_base == 0` the OS assigns an ephemeral port (the historical
+    // default); otherwise bind the first free port in the pinned range so a firewall
+    // can open a known port. An io error here is the caller's 5xx.
+    let socket = bind_media_socket(bind_ip, media_port_base, media_port_tries).await?;
 
     // Accept the offer → the str0m transport + the SDP answer. The advertised host
     // candidate is `advertise_ip` (when set), decoupled from the bound addr. A bad
@@ -161,6 +174,41 @@ where
     });
 
     Ok(answer)
+}
+
+/// Bind the WebRTC media UDP socket on `ip`.
+///
+/// `port_base == 0` → an OS-assigned **ephemeral** port (the historical default).
+/// Otherwise try `port_base, port_base+1, …` for `port_tries` ports (min 1) and bind
+/// the first that is free — so the media port can be pinned to a firewall-open range
+/// (one socket is bound per call). If the whole range is taken, the last bind error
+/// is surfaced (same [`FlowcatError`] path as the ephemeral bind) rather than
+/// silently falling back to an unreachable ephemeral port.
+async fn bind_media_socket(
+    ip: Ipv4Addr,
+    port_base: u16,
+    port_tries: u16,
+) -> Result<tokio::net::UdpSocket, FlowcatError> {
+    if port_base == 0 {
+        let bind = SocketAddr::new(IpAddr::V4(ip), 0);
+        return Ok(tokio::net::UdpSocket::bind(bind).await?);
+    }
+    let mut last_err = None;
+    for offset in 0..port_tries.max(1) {
+        let Some(port) = port_base.checked_add(offset) else {
+            break; // ran past u16::MAX — stop, surface the last error below
+        };
+        let bind = SocketAddr::new(IpAddr::V4(ip), port);
+        match tokio::net::UdpSocket::bind(bind).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free media port in range")
+        })
+        .into())
 }
 
 /// `POST /webrtc/offer` — accept the browser SDP offer and run the configured agent.
@@ -209,6 +257,11 @@ where
         sdp: body.sdp,
         bind_ip: state.webrtc_bind_ip,
         advertise_ip: state.webrtc_advertise_ip,
+        // Ephemeral media port — the standalone playground runs locally (no firewall
+        // to open). An embedder behind a firewall pins the port by calling
+        // `handle_offer` directly with `media_port_base`/`media_port_tries` set.
+        media_port_base: 0,
+        media_port_tries: 0,
         carrier_rate: WEBRTC_CARRIER_RATE,
         topology: (*state.topology).clone(),
         resolver: Arc::clone(&state.spec_resolver),
@@ -344,6 +397,8 @@ mod tests {
             sdp,
             bind_ip: std::net::Ipv4Addr::LOCALHOST,
             advertise_ip: None,
+            media_port_base: 0,
+            media_port_tries: 0,
             carrier_rate: WEBRTC_CARRIER_RATE,
             topology: TopologyConfig::Realtime {
                 provider: "gemini".into(),
@@ -378,6 +433,29 @@ mod tests {
             answer.contains("a=fingerprint:"),
             "answer carries the DTLS-SRTP fingerprint"
         );
+    }
+
+    #[tokio::test]
+    async fn bind_media_socket_ephemeral_then_pinned_range() {
+        let ip = std::net::Ipv4Addr::LOCALHOST;
+
+        // base 0 → an OS-assigned ephemeral port (nonzero).
+        let eph = bind_media_socket(ip, 0, 0).await.unwrap();
+        assert_ne!(eph.local_addr().unwrap().port(), 0);
+
+        // Pinned range: the socket binds a port within [base, base+tries).
+        let base = 51_000u16;
+        let tries = 20u16;
+        let pinned = bind_media_socket(ip, base, tries).await.unwrap();
+        let port = pinned.local_addr().unwrap().port();
+        assert!(
+            (base..base + tries).contains(&port),
+            "bound {port} outside the pinned range"
+        );
+
+        // The exact bound port with tries=1 is taken → an error, NOT a silent
+        // ephemeral fallback (the whole point of pinning behind a firewall).
+        assert!(bind_media_socket(ip, port, 1).await.is_err());
     }
 
     #[tokio::test]
