@@ -22,7 +22,7 @@ jobs:
     name: fmt · clippy · build · test (default features)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Rust (stable + rustfmt + clippy)
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
@@ -41,7 +41,7 @@ jobs:
     name: test every connector (gRPC + local)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # gRPC providers (Google/NVIDIA STT+TTS) codegen .proto via tonic-build.
       # cmake + a C/C++ toolchain (for the local Whisper build) are preinstalled.
       - name: Install protoc
