@@ -46,7 +46,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 rubato = "3"
 # Buffer views for rubato 3.x's `process_into_buffer` (audioadapter), same 3.x
 # line rubato pulls. Mono PCM wraps as a 1-channel `InterleavedSlice`.
-audioadapter-buffers = "3"
+audioadapter-buffers = "4"
 # G.711 mu-law / A-law encode+decode (encode_ulaw / decode_ulaw).
 audio-codec-algorithms = "0.8"
 # WAV writing for the call recorder.
