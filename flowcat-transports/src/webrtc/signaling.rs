@@ -45,7 +45,7 @@
 //!   be queued (consumer momentarily full) is dropped rather than stalling the
 //!   ICE/DTLS servicing loop.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -135,14 +135,18 @@ impl WebRtcPeer {
     /// - `offer_sdp` — the raw SDP offer text the browser POSTed. Length-capped
     ///   ([`MAX_OFFER_BYTES`]) and parsed defensively; a malformed/empty/oversized
     ///   offer yields [`FlowcatError::Protocol`] (never a panic).
-    /// - `socket` — an already-bound UDP socket; its local addr becomes our host
-    ///   ICE candidate. The caller chooses the bind interface (security).
+    /// - `socket` — an already-bound UDP socket. The caller chooses the bind
+    ///   interface (security).
+    /// - `advertise_ip` — the IP to put in the host ICE candidate. `Some` decouples
+    ///   the advertised address from the bound one (e.g. bind `0.0.0.0`, advertise a
+    ///   1:1-NAT public IP); `None` advertises the socket's own local addr.
     ///
     /// Returns the peer (drive it with [`run`](Self::run)) plus the answer SDP to
     /// hand back to the browser, and the [`PeerChannels`] for the transport.
     pub fn accept_offer(
         offer_sdp: &str,
         socket: UdpSocket,
+        advertise_ip: Option<IpAddr>,
     ) -> Result<(Self, String, PeerChannels), FlowcatError> {
         // SECURITY: cap before parse so a hostile oversized body can't blow up
         // the parser / memory.
@@ -165,13 +169,26 @@ impl WebRtcPeer {
             .local_addr()
             .map_err(|e| FlowcatError::Transport(format!("socket local_addr: {e}")))?;
 
+        // The advertised candidate addr: the explicit advertise IP at the bound
+        // port, else the bound addr itself.
+        let candidate_addr = match advertise_ip {
+            Some(ip) => SocketAddr::new(ip, local_addr.port()),
+            None => local_addr,
+        };
+        // str0m rejects a 0.0.0.0 host candidate; catch the misconfiguration
+        // (bound wildcard with no advertise IP) with a clear error, not a bad SDP.
+        if candidate_addr.ip().is_unspecified() {
+            return Err(FlowcatError::Transport(
+                "WebRTC host candidate would be 0.0.0.0; set an advertise IP when binding the wildcard".into(),
+            ));
+        }
+
         // Build the Rtc. str0m generates a fresh self-signed DTLS cert per Rtc,
         // resolves the crypto provider from feature flags, and leaves
         // `fingerprint_verification` ON (MITM guard) — we keep all defaults.
         let mut rtc = Rtc::new(Instant::now());
 
-        // Our single local host candidate is the bound UDP addr.
-        let candidate = Candidate::host(local_addr, "udp")
+        let candidate = Candidate::host(candidate_addr, "udp")
             .map_err(|e| FlowcatError::Transport(format!("host candidate: {e}")))?;
         rtc.add_local_candidate(candidate);
 
@@ -449,7 +466,8 @@ mod tests {
     async fn accept_offer_produces_valid_answer() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let offer = sample_browser_offer("127.0.0.1");
-        let (peer, answer, _ch) = WebRtcPeer::accept_offer(&offer, socket).expect("offer accepted");
+        let (peer, answer, _ch) =
+            WebRtcPeer::accept_offer(&offer, socket, None).expect("offer accepted");
 
         // We added our bound socket addr as the host candidate.
         assert_eq!(peer.local_addr().ip(), std::net::Ipv4Addr::LOCALHOST);
@@ -480,32 +498,69 @@ mod tests {
         // Empty.
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(matches!(
-            WebRtcPeer::accept_offer("", s),
+            WebRtcPeer::accept_offer("", s, None),
             Err(FlowcatError::Protocol(_))
         ));
 
         // Whitespace-only.
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(matches!(
-            WebRtcPeer::accept_offer("   \r\n  ", s),
+            WebRtcPeer::accept_offer("   \r\n  ", s, None),
             Err(FlowcatError::Protocol(_))
         ));
 
         // Garbage that is not SDP.
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        assert!(WebRtcPeer::accept_offer("this is not sdp at all", s).is_err());
+        assert!(WebRtcPeer::accept_offer("this is not sdp at all", s, None).is_err());
 
         // Truncated SDP (header only, no media). Must not panic — Ok or Err both
         // acceptable; reaching the next line proves no panic.
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _ = WebRtcPeer::accept_offer("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n", s);
+        let _ = WebRtcPeer::accept_offer("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n", s, None);
 
         // Oversized body is capped before parse.
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let big = "v=0\r\n".to_string() + &"a=x\r\n".repeat(MAX_OFFER_BYTES);
         assert!(matches!(
-            WebRtcPeer::accept_offer(&big, s),
+            WebRtcPeer::accept_offer(&big, s, None),
             Err(FlowcatError::Protocol(_))
+        ));
+    }
+
+    /// With `advertise_ip = Some(public)`, the host ICE candidate in the answer
+    /// carries the **advertised** IP (at the bound port), not the bound socket addr
+    /// — the bind/advertise split that lets us bind 0.0.0.0 yet advertise a public
+    /// 1:1-NAT IP. (Mirrors the SIP path: bind UNSPECIFIED, advertise public_ip.)
+    #[tokio::test]
+    async fn advertise_ip_overrides_the_candidate_address() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let advertised = std::net::Ipv4Addr::new(203, 0, 113, 7);
+        let offer = sample_browser_offer("127.0.0.1");
+        let (_peer, answer, _ch) =
+            WebRtcPeer::accept_offer(&offer, socket, Some(IpAddr::V4(advertised)))
+                .expect("offer accepted");
+
+        // The answer's host candidate advertises the public IP, not 127.0.0.1.
+        assert!(
+            answer.contains("203.0.113.7"),
+            "answer advertises the configured IP: {answer}"
+        );
+        assert!(
+            !answer.contains("a=candidate") || !answer.contains("127.0.0.1 "),
+            "answer must not advertise the bound loopback addr: {answer}"
+        );
+    }
+
+    /// Binding the wildcard with no advertise IP would yield a 0.0.0.0 candidate,
+    /// which str0m rejects — we catch that misconfiguration with a clean error
+    /// instead of producing an invalid SDP.
+    #[tokio::test]
+    async fn wildcard_bind_without_advertise_ip_is_rejected() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let offer = sample_browser_offer("127.0.0.1");
+        assert!(matches!(
+            WebRtcPeer::accept_offer(&offer, socket, None),
+            Err(FlowcatError::Transport(_))
         ));
     }
 
@@ -516,7 +571,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let offer = sample_browser_offer("127.0.0.1");
         let (mut peer, _answer, _ch) =
-            WebRtcPeer::accept_offer(&offer, socket).expect("offer accepted");
+            WebRtcPeer::accept_offer(&offer, socket, None).expect("offer accepted");
         let fake_source: SocketAddr = "127.0.0.1:5555".parse().unwrap();
         // A datagram that is neither STUN nor DTLS nor RTP.
         peer.handle_socket_input(&[0xFFu8, 0x00, 0x13, 0x37], fake_source);

@@ -90,6 +90,9 @@ impl WebRtcTransport {
     ///   [`signaling::WebRtcPeer::accept_offer`]).
     /// - `socket` — an already-bound UDP socket for the WebRTC media (the caller
     ///   chooses the bind interface — security).
+    /// - `advertise_ip` — the IP to advertise in the host ICE candidate; `Some`
+    ///   decouples it from the bound addr (bind `0.0.0.0`, advertise a public IP),
+    ///   `None` advertises the bound addr.
     /// - `carrier_rate` — the pipeline-facing sample rate (e.g. 16000).
     ///
     /// Returns the transport and the **SDP answer** string to send back to the
@@ -98,9 +101,11 @@ impl WebRtcTransport {
     pub fn accept_offer(
         offer_sdp: &str,
         socket: tokio::net::UdpSocket,
+        advertise_ip: Option<std::net::IpAddr>,
         carrier_rate: u32,
     ) -> Result<(Self, String), FlowcatError> {
-        let (peer, answer_sdp, channels) = WebRtcPeer::accept_offer(offer_sdp, socket)?;
+        let (peer, answer_sdp, channels) =
+            WebRtcPeer::accept_offer(offer_sdp, socket, advertise_ip)?;
         let PeerChannels {
             inbound_rx,
             outbound_tx,
@@ -268,7 +273,7 @@ mod tests {
         // --- Our transport: bind a socket, accept the offer, get the answer. ---
         let our_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (mut transport, answer_sdp) =
-            WebRtcTransport::accept_offer(&offer_sdp, our_socket, 16000).expect("accept");
+            WebRtcTransport::accept_offer(&offer_sdp, our_socket, None, 16000).expect("accept");
         assert_eq!(transport.carrier_rate(), 16000);
 
         // Feed our answer back to the browser to complete negotiation.
@@ -424,7 +429,7 @@ mod tests {
 
         let our_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (mut transport, _answer) =
-            WebRtcTransport::accept_offer(&offer.to_sdp_string(), our_socket, 16000).unwrap();
+            WebRtcTransport::accept_offer(&offer.to_sdp_string(), our_socket, None, 16000).unwrap();
 
         let err = transport
             .send_audio(AudioChunk::new(vec![0i16; 160], 8000))

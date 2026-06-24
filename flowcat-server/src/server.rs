@@ -58,10 +58,14 @@ pub struct AppState<S, B> {
     /// Monotonic per-call id source (`pc-<n>`).
     #[cfg(feature = "webrtc-helper")]
     pub(crate) next_pc: Arc<std::sync::atomic::AtomicU64>,
-    /// Concrete IPv4 the str0m media socket binds (str0m rejects 0.0.0.0); from
-    /// `FLOWCAT_WEBRTC_BIND_IP`, default loopback.
+    /// IPv4 the str0m media socket binds; from `FLOWCAT_WEBRTC_BIND_IP`, default
+    /// loopback. May be `0.0.0.0` when `webrtc_advertise_ip` supplies the candidate.
     #[cfg(feature = "webrtc-helper")]
     pub(crate) webrtc_bind_ip: std::net::Ipv4Addr,
+    /// IPv4 advertised as the host ICE candidate (decoupled from the bind addr);
+    /// from `FLOWCAT_WEBRTC_ADVERTISE_IP`, `None` → advertise the bound addr.
+    #[cfg(feature = "webrtc-helper")]
+    pub(crate) webrtc_advertise_ip: Option<std::net::Ipv4Addr>,
 }
 
 // Hand-written so the bound is on the `Arc`s we actually hold, not on `S`/`B`
@@ -80,6 +84,8 @@ impl<S, B> Clone for AppState<S, B> {
             next_pc: Arc::clone(&self.next_pc),
             #[cfg(feature = "webrtc-helper")]
             webrtc_bind_ip: self.webrtc_bind_ip,
+            #[cfg(feature = "webrtc-helper")]
+            webrtc_advertise_ip: self.webrtc_advertise_ip,
         }
     }
 }
@@ -109,6 +115,8 @@ impl<S, B> AppState<S, B> {
             next_pc: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             #[cfg(feature = "webrtc-helper")]
             webrtc_bind_ip: webrtc_bind_ip_from_env(),
+            #[cfg(feature = "webrtc-helper")]
+            webrtc_advertise_ip: webrtc_advertise_ip_from_env(),
         }
     }
 
@@ -143,13 +151,23 @@ impl AppState<StaticSession, DeclarativeBrain> {
 }
 
 /// Resolve the WebRTC media bind IP from `FLOWCAT_WEBRTC_BIND_IP` (default
-/// `127.0.0.1`; str0m advertises it as the host ICE candidate and rejects 0.0.0.0).
+/// `127.0.0.1`). May be `0.0.0.0` when `FLOWCAT_WEBRTC_ADVERTISE_IP` is set.
 #[cfg(feature = "webrtc-helper")]
 fn webrtc_bind_ip_from_env() -> std::net::Ipv4Addr {
     std::env::var("FLOWCAT_WEBRTC_BIND_IP")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(std::net::Ipv4Addr::LOCALHOST)
+}
+
+/// Resolve the advertised host-ICE-candidate IP from `FLOWCAT_WEBRTC_ADVERTISE_IP`
+/// (decoupled from the bind IP); `None` → advertise the bound addr.
+#[cfg(feature = "webrtc-helper")]
+fn webrtc_advertise_ip_from_env() -> Option<std::net::Ipv4Addr> {
+    std::env::var("FLOWCAT_WEBRTC_ADVERTISE_IP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
 }
 
 /// Assemble the axum router over the shared [`AppState`].

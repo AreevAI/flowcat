@@ -64,9 +64,14 @@ pub async fn playground_page() -> Html<&'static str> {
 pub struct OfferParams<B, S, G> {
     /// The browser's SDP offer (post-ICE-gathering, so it carries candidates).
     pub sdp: String,
-    /// Concrete IPv4 the media socket binds (str0m advertises it as the host ICE
-    /// candidate and rejects 0.0.0.0); the caller chooses the interface — security.
+    /// IPv4 the media socket binds; the caller chooses the interface — security.
+    /// May be `0.0.0.0` (bind all) when `advertise_ip` supplies the candidate IP.
     pub bind_ip: Ipv4Addr,
+    /// IP advertised as the host ICE candidate (str0m rejects 0.0.0.0). `Some`
+    /// decouples it from `bind_ip` — bind the wildcard, advertise a 1:1-NAT public
+    /// IP (the SIP path's bind-UNSPECIFIED / advertise-public_ip pattern). `None`
+    /// advertises the bound addr (the local default).
+    pub advertise_ip: Option<Ipv4Addr>,
     /// Pipeline-facing carrier sample rate the str0m transport resamples to.
     pub carrier_rate: u32,
     /// Which providers to run + how their specs (keys) resolve.
@@ -110,6 +115,7 @@ where
     let OfferParams {
         sdp,
         bind_ip,
+        advertise_ip,
         carrier_rate,
         topology,
         resolver,
@@ -121,14 +127,16 @@ where
         keepalive,
     } = params;
 
-    // Bind the media socket on the chosen interface (str0m advertises it as the
-    // host ICE candidate and rejects 0.0.0.0). An io error here is the caller's 5xx.
+    // Bind the media socket on the chosen interface (may be 0.0.0.0). An io error
+    // here is the caller's 5xx.
     let bind = SocketAddr::new(IpAddr::V4(bind_ip), 0);
     let socket = tokio::net::UdpSocket::bind(bind).await?;
 
-    // Accept the offer → the str0m transport + the SDP answer. A bad offer is an Err
-    // with no peer created.
-    let (transport, answer) = WebRtcTransport::accept_offer(&sdp, socket, carrier_rate)?;
+    // Accept the offer → the str0m transport + the SDP answer. The advertised host
+    // candidate is `advertise_ip` (when set), decoupled from the bound addr. A bad
+    // offer is an Err with no peer created.
+    let (transport, answer) =
+        WebRtcTransport::accept_offer(&sdp, socket, advertise_ip.map(IpAddr::V4), carrier_rate)?;
 
     // Run the call detached; the answer goes back to the browser now.
     info!(run_id, "webrtc offer accepted; running call detached");
@@ -200,6 +208,7 @@ where
     let answer = handle_offer(OfferParams {
         sdp: body.sdp,
         bind_ip: state.webrtc_bind_ip,
+        advertise_ip: state.webrtc_advertise_ip,
         carrier_rate: WEBRTC_CARRIER_RATE,
         topology: (*state.topology).clone(),
         resolver: Arc::clone(&state.spec_resolver),
@@ -334,6 +343,7 @@ mod tests {
         OfferParams {
             sdp,
             bind_ip: std::net::Ipv4Addr::LOCALHOST,
+            advertise_ip: None,
             carrier_rate: WEBRTC_CARRIER_RATE,
             topology: TopologyConfig::Realtime {
                 provider: "gemini".into(),
