@@ -252,7 +252,7 @@ async fn handle_inbound_invite<S, B, R>(
     let (brain, topology) = match orchestrator.resolve_call(&run).await {
         Ok(resolved) => resolved,
         Err(e) => {
-            warn!(%call_id, run_id = run.run_id, error = %e, "SIP brain build rejected the INVITE");
+            warn!(%call_id, run_id = run.run_id, error = %e, "SIP call resolution rejected the INVITE");
             invite.reject(None);
             return;
         }
@@ -522,7 +522,7 @@ mod tests {
 
     /// Start a callee (running `serve_sip_inbound`) + a caller wired to dial it.
     async fn start_callee_and_caller<R>(
-        session: Arc<FakeSession>,
+        orchestrator: SipOrchestrator<FakeSession, EchoBrain>,
         inbound_resolver: Arc<R>,
     ) -> (Arc<SipAgent>, Arc<SipAgent>)
     where
@@ -532,7 +532,7 @@ mod tests {
         let callee = start_loopback_agent("sip:127.0.0.1:1".to_string(), port_callee).await;
         tokio::spawn(serve_sip_inbound(
             Arc::clone(&callee),
-            orchestrator(session),
+            orchestrator,
             inbound_resolver,
         ));
 
@@ -545,9 +545,11 @@ mod tests {
     #[tokio::test]
     async fn serve_sip_inbound_answers_a_resolved_invite() {
         let session = FakeSession::new("hi from the control plane");
-        let (callee, caller) =
-            start_callee_and_caller(Arc::clone(&session), Arc::new(AcceptInbound { run_id: 42 }))
-                .await;
+        let (callee, caller) = start_callee_and_caller(
+            orchestrator(Arc::clone(&session)),
+            Arc::new(AcceptInbound { run_id: 42 }),
+        )
+        .await;
 
         // The caller dials; `serve_sip_inbound` resolves → builds the brain → answers.
         // A returned media transport means the INVITE was answered (200 OK).
@@ -569,7 +571,8 @@ mod tests {
     async fn serve_sip_inbound_rejects_when_the_resolver_errs() {
         let session = FakeSession::new("unused");
         let (callee, caller) =
-            start_callee_and_caller(Arc::clone(&session), Arc::new(RejectInbound)).await;
+            start_callee_and_caller(orchestrator(Arc::clone(&session)), Arc::new(RejectInbound))
+                .await;
 
         // The resolver rejects (unknown DID) → the INVITE is rejected, so the caller's
         // originate fails (no media transport) rather than connecting.
@@ -579,6 +582,47 @@ mod tests {
         assert!(
             dialed.is_err(),
             "a rejected inbound INVITE must not yield a media transport"
+        );
+
+        caller.shutdown().await;
+        callee.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_sip_inbound_rejects_when_the_topology_resolver_errs() {
+        // The per-call topology seam sits in the same pre-answer window as the brain,
+        // so a topology resolver that errs must fail the call *closed* — reject the
+        // INVITE rather than answer a call whose pipeline we can't build.
+        let session = FakeSession::new("unused");
+        let factory: BrainFactory<EchoBrain> = Arc::new(|resolved: &ResolvedCall| {
+            Ok(EchoBrain {
+                prompt: resolved.brain_config["prompt"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        });
+        let topology_resolver: TopologyResolver = Arc::new(|_: &ResolvedCall| {
+            Err(FlowcatError::Other("no topology for this run".into()))
+        });
+        let orchestrator = SipOrchestrator::with_topology_resolver(
+            Arc::clone(&session),
+            factory,
+            topology_resolver,
+            Arc::new(run::env_spec_resolver),
+        );
+
+        let (callee, caller) =
+            start_callee_and_caller(orchestrator, Arc::new(AcceptInbound { run_id: 42 })).await;
+
+        // The topology resolver errs → the INVITE is rejected, so the caller's
+        // originate fails (no media transport) rather than connecting.
+        let dialed = tokio::time::timeout(Duration::from_secs(5), caller.originate("2000", None))
+            .await
+            .expect("originate timed out");
+        assert!(
+            dialed.is_err(),
+            "a topology-resolver error must reject the INVITE, not answer it"
         );
 
         caller.shutdown().await;

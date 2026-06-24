@@ -65,7 +65,9 @@ pub use server::{build_router, AppState, BrainFactory};
 // The generic SIP inbound/originate orchestration — the SIP analogue of the
 // carrier media-WS path (`media_ws` + `run_call_with`).
 #[cfg(feature = "server-helper")]
-pub use sip::{serve_sip_inbound, sip_originate, SipInboundResolver, SipOrchestrator, SipRun};
+pub use sip::{
+    serve_sip_inbound, sip_originate, SipInboundResolver, SipOrchestrator, SipRun, TopologyResolver,
+};
 
 #[cfg(feature = "webrtc-helper")]
 pub use webrtc::{handle_offer, OfferParams};
