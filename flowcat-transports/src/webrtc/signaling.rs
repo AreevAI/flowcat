@@ -105,7 +105,7 @@ pub struct OpusOut {
 pub struct WebRtcPeer {
     rtc: Rtc,
     socket: Arc<UdpSocket>,
-    local_addr: SocketAddr,
+    candidate_addr: SocketAddr,
     /// The audio media `Mid`, learned from the accepted offer (browsers send an
     /// audio m-line). Outbound audio is written to this mid.
     audio_mid: Option<Mid>,
@@ -208,7 +208,7 @@ impl WebRtcPeer {
         let peer = Self {
             rtc,
             socket,
-            local_addr,
+            candidate_addr,
             audio_mid: None,
             inbound_tx,
             outbound_rx,
@@ -224,9 +224,9 @@ impl WebRtcPeer {
         Ok((peer, answer_sdp, channels))
     }
 
-    /// The bound local UDP address (the host ICE candidate). Useful for tests.
+    /// The advertised host ICE candidate address. Useful for tests.
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.candidate_addr
     }
 
     /// Drive the str0m event loop until the peer disconnects or the loop is
@@ -389,7 +389,7 @@ impl WebRtcPeer {
             Receive {
                 proto: Protocol::Udp,
                 source,
-                destination: self.local_addr,
+                destination: self.candidate_addr,
                 contents,
             },
         );
@@ -536,9 +536,15 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let advertised = std::net::Ipv4Addr::new(203, 0, 113, 7);
         let offer = sample_browser_offer("127.0.0.1");
-        let (_peer, answer, _ch) =
+        let (peer, answer, _ch) =
             WebRtcPeer::accept_offer(&offer, socket, Some(IpAddr::V4(advertised)))
                 .expect("offer accepted");
+
+        assert_eq!(
+            peer.local_addr().ip(),
+            IpAddr::V4(advertised),
+            "receive destination must equal the advertised candidate, not the bound addr"
+        );
 
         // The answer's host candidate advertises the public IP, not 127.0.0.1.
         assert!(
