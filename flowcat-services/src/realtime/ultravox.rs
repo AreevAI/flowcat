@@ -181,6 +181,11 @@ impl RealtimeLlmService for UltravoxRealtime {
         // creation time; there is no in-session system update over the WS. A
         // brain transition is expressed by minting a new call (REST) — out of
         // scope for this skeleton. No-op so a transition does not error the call.
+        //
+        // ContextRelay is therefore UNSUPPORTED on Ultravox: the default
+        // `rebase_session` falls through to this no-op (no reconnect, so the audio
+        // history is never dropped), and Ultravox emits no per-turn usage event for
+        // the relay's budget trigger anyway. See docs/context-relay-evaluation.md §3a.
         tracing::debug!("ultravox: update_system is a no-op (prompt/tools bound at call creation)");
         Ok(())
     }

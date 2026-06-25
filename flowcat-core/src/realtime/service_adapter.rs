@@ -70,6 +70,16 @@ impl<S: RealtimeLlmService> RealtimeLlm for ServiceRealtimeAdapter<S> {
         self.inner.update_system(prompt, tools).await
     }
 
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<ToolDecl>,
+    ) -> Result<(), FlowcatError> {
+        // Delegate to the connector's re-base (the audio-dropping reopen for the
+        // OpenAI family; the default in-session swap otherwise).
+        self.inner.rebase_session(prompt, tools).await
+    }
+
     async fn send_tool_result(
         &mut self,
         id: String,

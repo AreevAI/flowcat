@@ -54,6 +54,28 @@ pub trait RealtimeLlm: Send {
         tools: Vec<ToolDecl>,
     ) -> Result<(), FlowcatError>;
 
+    /// Re-base the session onto a new system prompt + tools, **dropping the
+    /// accumulated audio context** (the ContextRelay re-base — PROCESSOR-DESIGN
+    /// §10 extension). Unlike [`update_system`](Self::update_system), which a graph
+    /// transition uses to swap the prompt while keeping the conversation in place,
+    /// this is the audio→text re-base: the caller has folded the prior audio
+    /// conversation into the cheap text `prompt`, so the expensive audio history
+    /// must be evicted, not re-attended every turn.
+    ///
+    /// The default delegates to [`update_system`](Self::update_system) — correct for
+    /// a backend whose `update_system` already reopens the session (e.g.
+    /// [`GeminiLive`], which has no in-session update and reconnects). A backend whose
+    /// `update_system` is an *in-session* update that keeps audio (OpenAI Realtime and
+    /// its family) MUST override this to actually drop the history (typically by
+    /// reopening the session with the new prompt).
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<ToolDecl>,
+    ) -> Result<(), FlowcatError> {
+        self.update_system(prompt, tools).await
+    }
+
     /// Return the result of a tool/function call back to the model.
     async fn send_tool_result(
         &mut self,
@@ -132,6 +154,13 @@ impl RealtimeLlm for Box<dyn RealtimeBackend> {
         tools: Vec<ToolDecl>,
     ) -> Result<(), FlowcatError> {
         (**self).update_system(prompt, tools).await
+    }
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<ToolDecl>,
+    ) -> Result<(), FlowcatError> {
+        (**self).rebase_session(prompt, tools).await
     }
     async fn send_tool_result(
         &mut self,

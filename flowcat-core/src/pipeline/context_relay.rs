@@ -405,8 +405,14 @@ impl ContextRelayProcessor {
         // model isn't awaiting a tool call here, only a fresh system context.
         let prompt = self.effective_prompt();
         let tools = self.base_tools.clone();
-        link.push_up(Frame::Custom(Arc::new(Reprompt { prompt, tools })))
-            .await;
+        // This is the re-base: the prior audio has been digested into `prompt` as
+        // text, so the realtime service must DROP the audio history (`rebase=true`).
+        link.push_up(Frame::Custom(Arc::new(Reprompt {
+            prompt,
+            tools,
+            rebase: true,
+        })))
+        .await;
 
         // Fold the turns now older than `keep_recent_turns` into the summary so the
         // NEXT re-base carries fewer verbatim turns. Runs detached; releases the
@@ -494,8 +500,16 @@ impl FrameProcessor for ContextRelayProcessor {
                 self.base_tools = rp.tools.clone();
                 let prompt = self.effective_prompt();
                 let tools = self.base_tools.clone();
-                link.push_up(Frame::Custom(Arc::new(Reprompt { prompt, tools })))
-                    .await;
+                // Preserve the producer's re-base intent: a graph transition stays an
+                // in-session update (`rebase=false`) — only the relay's own compaction
+                // path (above) drops audio. The enrichment just carries the digest
+                // text forward so a session that *does* re-establish isn't left blank.
+                link.push_up(Frame::Custom(Arc::new(Reprompt {
+                    prompt,
+                    tools,
+                    rebase: rp.rebase,
+                })))
+                .await;
             }
 
             _ => link.push(env.meta, env.frame, env.direction).await,

@@ -83,9 +83,6 @@ struct Connection {
     sink: Arc<Mutex<WsSink>>,
     events: mpsc::UnboundedReceiver<RealtimeEvent>,
     reader: JoinHandle<()>,
-    /// Fired by the reader on each queued event so the pipeline can await readiness
-    /// without holding the session lock (the lock-free `poll_event` path).
-    notify: Arc<Notify>,
 }
 
 impl Connection {
@@ -118,6 +115,18 @@ pub struct OpenAiRealtime {
     language: Option<String>,
     conn: Option<Connection>,
     setup: Option<RealtimeServiceSetup>,
+    /// Readiness notify for the lock-free event path, created **once** and reused
+    /// across every [`open`](Self::open) (incl. a [`rebase_session`] reconnect). The
+    /// s2s reader captures this handle a single time at startup, so it must stay
+    /// stable across reconnects — a per-connection notify would strand the reader on
+    /// a dead handle after a re-base (mirrors [`GeminiLive`]'s persistent
+    /// `event_notify`).
+    event_notify: Arc<Notify>,
+    /// The session's `turn_detection` config. Defaults to `{"type":"semantic_vad"}`
+    /// (a model decides when the caller is *semantically* done — best for live human
+    /// calls). Overridable to `server_vad` (endpoint purely on a silence duration),
+    /// which is more robust for non-interactive / synthetic / file-streamed audio.
+    turn_detection: Value,
 }
 
 impl OpenAiRealtime {
@@ -130,6 +139,8 @@ impl OpenAiRealtime {
             language: None,
             conn: None,
             setup: None,
+            event_notify: Arc::new(Notify::new()),
+            turn_detection: json!({ "type": "semantic_vad" }),
         }
     }
 
@@ -144,6 +155,27 @@ impl OpenAiRealtime {
     pub fn with_input_language(mut self, language: Option<String>) -> Self {
         self.language = language.filter(|s| !s.is_empty());
         self
+    }
+
+    /// Override the session `turn_detection` JSON (the default is
+    /// `{"type":"semantic_vad"}`). Pass a full object, e.g.
+    /// `json!({"type":"server_vad","silence_duration_ms":500})`.
+    pub fn with_turn_detection(mut self, turn_detection: Value) -> Self {
+        self.turn_detection = turn_detection;
+        self
+    }
+
+    /// Use **server VAD** (silence-duration endpointing) instead of the default
+    /// semantic VAD. More robust for non-interactive callers — synthetic speech,
+    /// file-streamed audio, or any source whose end-of-turn is a plain pause rather
+    /// than a semantic cue (semantic VAD can fail to endpoint such audio). Auto-
+    /// creates the bot response on turn end, matching the semantic-VAD default.
+    pub fn with_server_vad(self) -> Self {
+        self.with_turn_detection(json!({
+            "type": "server_vad",
+            "silence_duration_ms": 500,
+            "create_response": true,
+        }))
     }
 
     /// Override the WSS base URL (used by the Azure/Grok wrappers). The
@@ -217,21 +249,20 @@ impl OpenAiRealtime {
         let (mut sink, stream) = socket.split();
 
         // Send the initial session.update (instructions + tools + audio config).
-        let session = encode_session_update(setup, self.language.as_deref());
+        let session = encode_session_update(setup, self.language.as_deref(), &self.turn_detection);
         sink.send(Message::text(serde_json::to_string(&session)?))
             .await
             .map_err(|e| FlowcatError::Realtime(format!("send session.update: {e}")))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         let out_rate = out_or_default(setup.output_sample_rate);
-        let notify = Arc::new(Notify::new());
-        let reader = tokio::spawn(reader_task(stream, tx, out_rate, notify.clone()));
+        // Reuse the persistent notify (stable across reconnects — see the field doc).
+        let reader = tokio::spawn(reader_task(stream, tx, out_rate, self.event_notify.clone()));
 
         self.conn = Some(Connection {
             sink: Arc::new(Mutex::new(sink)),
             events: rx,
             reader,
-            notify,
         });
         Ok(())
     }
@@ -275,8 +306,37 @@ impl RealtimeLlmService for OpenAiRealtime {
             .ok_or_else(|| FlowcatError::Realtime("update_system before connect".into()))?;
         setup.system_prompt = prompt;
         setup.tools = tools;
-        let msg = encode_session_update(&setup, self.language.as_deref());
+        let msg = encode_session_update(&setup, self.language.as_deref(), &self.turn_detection);
         self.require_conn()?.send_json(&msg).await?;
+        self.setup = Some(setup);
+        Ok(())
+    }
+
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<Tool>,
+    ) -> Result<(), FlowcatError> {
+        // A ContextRelay re-base must DROP the accumulated audio history — but
+        // `update_system` above is an in-session `session.update` that KEEPS every
+        // prior audio item in the conversation, so they keep being re-billed each
+        // turn. OpenAI Realtime has no reliable in-session "evict all audio" that
+        // shrinks the billed context window, so — exactly like Gemini Live's
+        // reconnecting `update_system` — we reopen the socket with the new
+        // instructions (the caller's text digest) as the fresh session prompt. The
+        // new session carries no prior audio; the cheap text digest stands in for it.
+        //
+        // No re-kickoff: a re-base fires at an idle bot-turn boundary, so the next
+        // caller utterance drives the first response on the fresh session (mirrors
+        // Gemini's silent reconnect — the bot doesn't re-greet). `open()` reuses the
+        // persistent `event_notify`, so the s2s reader keeps waking after the reopen.
+        let mut setup = self
+            .setup
+            .clone()
+            .ok_or_else(|| FlowcatError::Realtime("rebase_session before connect".into()))?;
+        setup.system_prompt = prompt;
+        setup.tools = tools;
+        self.open(&setup).await?;
         self.setup = Some(setup);
         Ok(())
     }
@@ -297,7 +357,9 @@ impl RealtimeLlmService for OpenAiRealtime {
     /// readiness WITHOUT holding the session lock — the lock-free path that keeps
     /// `send_audio` (caller audio) from starving between bot turns.
     fn event_notify(&self) -> Option<Arc<Notify>> {
-        self.conn.as_ref().map(|c| c.notify.clone())
+        // The persistent handle (not the per-connection one) so it stays valid across
+        // a `rebase_session` reconnect — the s2s reader captures this exactly once.
+        Some(self.event_notify.clone())
     }
 
     /// Non-blocking poll: `try_recv` the event channel (brief lock, no idle wait).
@@ -357,7 +419,11 @@ fn out_or_default(rate: u32) -> u32 {
 ///   "tool_choice":"auto"
 /// }}
 /// ```
-fn encode_session_update(setup: &RealtimeServiceSetup, language: Option<&str>) -> Value {
+fn encode_session_update(
+    setup: &RealtimeServiceSetup,
+    language: Option<&str>,
+    turn_detection: &Value,
+) -> Value {
     let voice = std::env::var("FLOWCAT_VOICE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -385,14 +451,16 @@ fn encode_session_update(setup: &RealtimeServiceSetup, language: Option<&str>) -
             "input": {
                 "format": { "type": "audio/pcm", "rate": in_rate },
                 "transcription": transcription,
-                // Semantic VAD: a turn-detection model ends the turn when the user
-                // is SEMANTICALLY done, not on raw silence. `server_vad` chunks on
-                // every silence gap, so a natural mid-sentence pause splits one
-                // utterance into several `input_audio_transcription.completed`
+                // Turn detection (default `semantic_vad`): a model ends the turn when
+                // the user is SEMANTICALLY done, not on raw silence. `server_vad`
+                // chunks on every silence gap, so a natural mid-sentence pause splits
+                // one utterance into several `input_audio_transcription.completed`
                 // events → several transcript bubbles ("Got" / "It ." / …). Semantic
                 // VAD keeps an utterance as one segment → one bubble, and is less
                 // likely to cut the user off. Barge-in still works (speech_started).
-                "turn_detection": { "type": "semantic_vad" }
+                // Overridable via `with_turn_detection` / `with_server_vad` (server
+                // VAD is more robust for non-interactive / synthetic audio).
+                "turn_detection": turn_detection.clone()
             },
             "output": {
                 "format": { "type": "audio/pcm", "rate": out_rate },
@@ -681,9 +749,14 @@ mod tests {
 
     // ---- ENCODE -----------------------------------------------------------
 
+    /// The default turn-detection JSON, for the encode fixtures below.
+    fn semantic() -> Value {
+        json!({ "type": "semantic_vad" })
+    }
+
     #[test]
     fn session_update_has_instructions_audio_and_tools() {
-        let v = encode_session_update(&sample_setup(), None);
+        let v = encode_session_update(&sample_setup(), None, &semantic());
         assert_eq!(v["type"], "session.update");
         let s = &v["session"];
         assert_eq!(s["type"], "realtime");
@@ -714,13 +787,22 @@ mod tests {
     fn session_update_omits_tools_when_empty() {
         let mut s = sample_setup();
         s.tools.clear();
-        let v = encode_session_update(&s, None);
+        let v = encode_session_update(&s, None, &semantic());
         assert!(v["session"].get("tools").is_none());
     }
 
     #[test]
+    fn session_update_uses_the_given_turn_detection() {
+        // The default semantic_vad rides through (asserted above); a server_vad
+        // override is emitted verbatim so callers can pick endpointing behaviour.
+        let sv = json!({ "type": "server_vad", "silence_duration_ms": 500 });
+        let v = encode_session_update(&sample_setup(), None, &sv);
+        assert_eq!(v["session"]["audio"]["input"]["turn_detection"], sv);
+    }
+
+    #[test]
     fn session_update_includes_language_hint_when_set() {
-        let v = encode_session_update(&sample_setup(), Some("en"));
+        let v = encode_session_update(&sample_setup(), Some("en"), &semantic());
         let t = &v["session"]["audio"]["input"]["transcription"];
         assert_eq!(t["language"], "en");
         // A configured language switches to whisper-1 (it honors the hint).
@@ -729,7 +811,7 @@ mod tests {
 
     #[test]
     fn session_update_auto_detects_without_language() {
-        let v = encode_session_update(&sample_setup(), None);
+        let v = encode_session_update(&sample_setup(), None, &semantic());
         let t = &v["session"]["audio"]["input"]["transcription"];
         assert!(t.get("language").is_none());
         assert_eq!(t["model"], "gpt-4o-transcribe");
@@ -776,6 +858,31 @@ mod tests {
             "wss://x.openai.azure.com/openai/realtime?api-version=2025-04-01&deployment=d",
         );
         assert!(azure.url("ignored").contains("deployment=d"));
+    }
+
+    #[test]
+    fn event_notify_is_persistent_across_calls() {
+        // The s2s reader captures `event_notify()` exactly once, so it must return a
+        // STABLE handle even before connect and across reconnects — a per-connection
+        // notify would strand the reader after a `rebase_session` reopen.
+        use flowcat_core::service::RealtimeLlmService;
+        let c = OpenAiRealtime::new("sk-test");
+        let a = c.event_notify().expect("a notify even before connect");
+        let b = c.event_notify().expect("a notify");
+        assert!(Arc::ptr_eq(&a, &b), "event_notify must be the same Arc");
+    }
+
+    #[tokio::test]
+    async fn rebase_session_before_connect_is_a_clean_error() {
+        // A re-base needs the stored setup to reopen with; before connect there is
+        // none, so it must be a clean error, not a panic or a cryptic socket failure.
+        use flowcat_core::service::RealtimeLlmService;
+        let mut c = OpenAiRealtime::new("sk-test");
+        let err = match c.rebase_session("digest prompt".into(), vec![]).await {
+            Ok(()) => panic!("rebase_session before connect should error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("before connect"), "got: {err}");
     }
 
     // ---- DECODE (hand-written server-event fixtures) ----------------------

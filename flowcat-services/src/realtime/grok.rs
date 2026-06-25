@@ -67,6 +67,17 @@ impl RealtimeLlmService for GrokRealtime {
         self.inner.update_system(prompt, tools).await
     }
 
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<Tool>,
+    ) -> Result<(), FlowcatError> {
+        // Delegate to OpenAiRealtime's reconnecting re-base (drops audio history).
+        // Without this explicit forward, the trait default would call our delegated
+        // `update_system` (an in-session update that KEEPS audio), defeating the relay.
+        self.inner.rebase_session(prompt, tools).await
+    }
+
     async fn send_tool_result(&mut self, id: String, result: Value) -> Result<(), FlowcatError> {
         self.inner.send_tool_result(id, result).await
     }

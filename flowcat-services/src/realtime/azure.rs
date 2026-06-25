@@ -71,6 +71,16 @@ impl RealtimeLlmService for AzureRealtime {
         self.inner.update_system(prompt, tools).await
     }
 
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<Tool>,
+    ) -> Result<(), FlowcatError> {
+        // Delegate to OpenAiRealtime's reconnecting re-base (drops audio history) —
+        // the trait default would otherwise route through our in-session update_system.
+        self.inner.rebase_session(prompt, tools).await
+    }
+
     async fn send_tool_result(&mut self, id: String, result: Value) -> Result<(), FlowcatError> {
         self.inner.send_tool_result(id, result).await
     }

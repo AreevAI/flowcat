@@ -134,6 +134,18 @@ pub trait RealtimeLlmService: Send {
     async fn connect(&mut self, setup: RealtimeServiceSetup) -> Result<()>;
     async fn send_audio(&mut self, chunk: Arc<AudioFrame>) -> Result<()>;
     async fn update_system(&mut self, prompt: String, tools: Vec<Tool>) -> Result<()>;
+
+    /// Re-base the session onto a new system prompt + tools, **dropping the
+    /// accumulated audio context** (the ContextRelay re-base — see
+    /// [`RealtimeLlm::rebase_session`](crate::realtime::RealtimeLlm::rebase_session)).
+    /// The default delegates to [`update_system`](Self::update_system); a connector
+    /// whose `update_system` is an in-session update that keeps audio (the OpenAI
+    /// Realtime family) overrides this to reopen the session so the expensive audio
+    /// history is evicted, not re-attended every turn.
+    async fn rebase_session(&mut self, prompt: String, tools: Vec<Tool>) -> Result<()> {
+        self.update_system(prompt, tools).await
+    }
+
     async fn send_tool_result(&mut self, id: String, result: serde_json::Value) -> Result<()>;
     async fn next_event(&mut self) -> Option<RealtimeEvent>;
 

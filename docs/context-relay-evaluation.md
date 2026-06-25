@@ -144,6 +144,145 @@ eviction described in §2. **[MEASURED]**
 
 ---
 
+## 3a. Beyond Gemini — OpenAI Realtime, X.AI (Grok), and the rest
+
+ContextRelay rides only the realtime trait surface (final transcripts + a per-turn
+usage signal + the `update_system`/re-base seam), so it is **provider-portable in
+principle**. But the *cost* win depends on one provider-specific fact: does re-basing
+actually **drop the accumulated audio**, and is that audio **re-billed at full price**
+every turn? Those answers differ by provider, so the headline number does too.
+
+**The re-base seam is now wired for the OpenAI-protocol family.** flowcat distinguishes
+an ordinary graph-transition re-prompt (in-session `update_system`, keeps the
+conversation) from a **ContextRelay re-base** (`rebase_session`, must drop the audio).
+For Gemini Live both already reconnect (it has no in-session update). For **OpenAI
+Realtime, X.AI Grok, Inworld, and Azure** — all of which speak the OpenAI Realtime wire
+protocol — `update_system` is an *in-session* `session.update` that **keeps** every
+prior audio item, so a re-base there now **reopens the socket** with the text digest as
+the fresh session prompt (the same audio→text reset Gemini gets). Without this, the
+relay would swap the prompt but leave the expensive audio context in place.
+
+**OpenAI `gpt-realtime-2` token rates** (per 1M tokens) **[CITED]**
+([OpenAI pricing](https://developers.openai.com/api/docs/pricing)):
+
+| | Text | Audio | Cached input |
+|---|---|---|---|
+| **Input** | **$4.00** | **$32.00** | **$0.40** |
+| **Output** | $24.00 | $64.00 | — |
+
+Audio is metered at **1 token / 100 ms of user audio (10 tok/s) and 1 token / 50 ms of
+assistant audio (20 tok/s)** **[CITED]**
+([Realtime cost guide](https://developers.openai.com/api/docs/guides/realtime-costs)).
+The directly-comparable lever — **cost to re-attend 1 min of conversation, per turn**,
+billed in full (cache-**cold**, which is the case Gemini is *always* in, since Live has
+no caching):
+
+| | Token rate | Input price | Cost to **re-attend 1 min** (per turn) |
+|---|---|---|---|
+| **Audio context** | ~900 tok/min (10/20 tok/s mix) **[CITED]** | **$32 / 1M [CITED]** | **$0.0288** |
+| **Text transcript** | ~214 tok/min **[CITED rates]** | **$4 / 1M [CITED]** | **$0.00086** |
+
+- **~4× more compact** (900 ÷ 214) **·** **8× cheaper per token** ($32 ÷ $4)
+  **→ ≈ 34× cheaper to carry a minute as text than as cache-cold audio**, per turn.
+  **[ESTIMATE from CITED rates]** (Audio is bulkier-per-second than Gemini-rate text but
+  ~40% *less* bulky than Gemini-rate audio; the higher $32/1M audio price is what lifts
+  the cold-cache multiplier above Gemini's ~28×.)
+
+**The important difference from Gemini: OpenAI Realtime *has* prompt caching.** Repeated
+context that stays in the prefix is billed at the **cached input rate ($0.40/1M, 80×
+below uncached audio)**, so on a warm cache the re-attended audio history is *already*
+cheap — the "re-billed at full audio price every turn" premise that drives Gemini's
+~28× simply **does not hold** for OpenAI. So ContextRelay's win on OpenAI is **real but
+more modest**, and comes from three places, not from a 28× per-turn multiplier:
+
+1. **Fewer tokens.** Even at the cached rate, text is several× more compact than audio,
+   so the carried context is smaller every turn.
+2. **Cache-miss protection.** The realtime cache has a short TTL; after an idle gap the
+   prefix falls out of cache and the **entire audio history is re-billed at the full
+   $32/1M** on the next turn. Carrying compact text bounds that worst case.
+3. **Context-window + session headroom.** Audio fills the context window ~7× faster than
+   text; converting to text extends how long a call can run before it hits the window or
+   a session cap — the same memory lever as §2, independent of price.
+
+**Snapshot at 15 minutes (`gpt-realtime-2`) — the context re-attended per turn**
+**[ESTIMATE from CITED rates]** (mixed audio ≈ 900 tok/min → ~13.5k; text ≈ 214 tok/min
+→ ~3.2k; the audio↔text *ratio* is robust, the absolute dollars depend on call shape):
+
+| Context carried | Tokens | $/turn — **warm cache** | $/turn — **cache miss / cold** |
+|---|---|---|---|
+| Full call as **audio** | ~13,500 | $0.0054 (@ $0.40/1M cached) | **$0.432** (@ $32/1M) |
+| Full call as **text** (ContextRelay) | ~3,200 | $0.0013 (@ $0.40/1M cached) | $0.0128 (@ $4/1M) |
+| | | **≈ 4× cheaper** | **≈ 34× cheaper** |
+
+So unlike Gemini's steady ~28×, OpenAI's win is a **range set by the cache state**: only
+**~4×** when the whole prefix is a warm cache hit (the saving is then pure token-count
+compaction), but **~34×** on a cold/missed cache, where the full audio history is
+re-billed at $32/1M (audio is pricier than Gemini's, so the cold-cache multiplier is
+actually *larger*). Real calls sit between the two, driven by idle gaps vs the cache
+TTL — which is exactly the cache-miss insurance ContextRelay provides. The
+qualitative takeaway holds: **"bounded growth, cache-miss insurance, and longer
+calls,"** now with the bracket attached. **[ESTIMATE from CITED rates]**
+
+Because that context is re-billed every turn, the saving compounds. *Illustrative
+cumulative re-billed-input over a 15-min, ~45-turn call, cache-**cold**:* **~$10
+(audio) vs ~$0.30 (text)** — **[ESTIMATE]** (context grows ~0→13.5k audio / ~0→3.2k
+text, averaged over the turns × the cold rates above). A **warm** cache scales both
+down ~80× (to **~$0.12 vs ~$0.004**), so the realized saving tracks the call's
+cache-hit rate. As with Gemini this is the *re-billed-history* component; fresh-audio-in
+and audio-out are unchanged.
+
+**Per-turn audio/text split — to be MEASURED.** The Gemini section quotes a measured
+per-turn split ("259 audio + 225 text"); the OpenAI analogue isn't captured yet because
+the connector's `decode_usage` records only the **total** `input_tokens` (the 254→87
+above), not OpenAI's `usage.input_token_details.{audio,text,cached}_tokens` breakdown. A
+small connector follow-up (read those sub-fields) + a re-run would give the same measured
+split, and a measured *dollar* figure rather than the estimate.
+
+**X.AI Grok Realtime** speaks the same protocol (so the same re-base applies) but is
+billed **per-minute (~$0.05/min)**, not per audio/text token **[CITED]**
+([xAI pricing](https://docs.x.ai/developers/models)) — so there is no per-turn token
+re-bill to convert away; its lever is purely the memory/long-call side.
+
+**Provider applicability at a glance:**
+
+| Provider | Re-base drops audio? | Per-turn token re-bill? | ContextRelay benefit |
+|---|---|---|---|
+| Gemini / Vertex | Yes (reconnect) | Yes, **no caching** | **Strong** — cost (~28×) + memory |
+| OpenAI Realtime | Yes (reconnect, new) | Yes, but **cached** | **Moderate** — compaction + cache-miss insurance + headroom |
+| Grok (X.AI) | Yes (reconnect, new) | **Per-minute billed** | Memory / long-call only |
+| Inworld, Azure | Yes (inherit OpenAI) | As OpenAI | As OpenAI |
+| **Ultravox** | **No** (prompt bound at REST create; no in-session/​reconnect update) | No usage event emitted | **Unsupported** — the relay's signals + re-base seam aren't available |
+
+**Live validation — OpenAI Realtime [MEASURED].** A real `gpt-realtime` session
+(`flowcat-services/tests/live_openai_context_relay.rs`, `#[ignore]`d) driven by a
+macOS-`say` synthetic caller: the caller gives *"my account number is four four seven
+two"*, one filler turn grows the audio context, then `rebase_session` reopens the
+socket onto a text digest; the caller then asks for the number back. Transcribed bot
+reply after the re-base:
+
+> *"Your account number is **4472**."*
+
+So recall survived the audio→text re-base. And the per-turn `input_tokens` the model
+re-attended show the audio being dropped:
+
+| Turn | input_tokens | |
+|---|---|---|
+| turn 1 (caller states the number) | 149 | audio context accumulating |
+| turn 2 (filler) — **pre-rebase** | **254** | full audio history re-attended |
+| turn 3 (recall) — **post-rebase** | **87** | fresh session re-attends only the text digest |
+
+The re-base cut the re-attended context **254 → 87 (~66%)** and, crucially, the
+post-rebase figure stays *bounded* (digest-sized) instead of climbing turn-over-turn
+the way the audio history does. **[MEASURED]** (Note: needs `server_vad` — the
+connector's default `semantic_vad` doesn't reliably endpoint synthetic `say` audio;
+`OpenAiRealtime::with_server_vad()` selects it.)
+
+> **X.AI (Grok) still to be MEASURED**, and the dollar figures above are derived from
+> published rates, not live calls — Grok bills per-minute, so its lever is the
+> memory/long-call side; a live Grok run with the same harness is the remaining check.
+
+---
+
 ## 4. Honest trade-offs
 
 - **Reseed latency.** Converting + reseeding briefly re-establishes the session; flowcat
@@ -169,7 +308,10 @@ eviction described in §2. **[MEASURED]**
 - **Calls that outrun the 15-minute audio cap** — reseed into a fresh session with a
   context you control.
 - **Provider-portability** — ContextRelay rides only the realtime trait surface, so the
-  same audio→text+reseed applies to OpenAI Realtime, Nova Sonic, etc., not just Gemini.
+  same audio→text re-base applies to the OpenAI Realtime family (OpenAI, X.AI Grok,
+  Inworld, Azure) as well as Gemini/Vertex — see §3a for the per-provider economics
+  (the *cost* win is strongest on Gemini, more modest on the cache-having OpenAI family,
+  and memory-only on per-minute-billed Grok). Ultravox is unsupported (§3a table).
 
 ---
 
@@ -182,10 +324,26 @@ export FLOWCAT_CONTEXT_RELAY_MAX_SESSION_SECS=6                    # force resee
 export FLOWCAT_CONTEXT_RELAY_SUMMARIZER=gemini/gemini-2.5-flash    # optional: LLM summary
 cargo run -p flowcat-server --features webrtc -- --config agent.yaml   # realtime: gemini, model: models/gemini-3.1-flash-live-preview
 ```
-Reseeds log as `context-relay: re-basing realtime session onto text digest`.
+
+For **OpenAI Realtime** (or X.AI Grok — same flags, `realtime: grok` + `GROK_API_KEY`):
+
+```bash
+export OPENAI_API_KEY=sk-…
+export FLOWCAT_CONTEXT_RELAY=1
+export FLOWCAT_CONTEXT_RELAY_MAX_SESSION_SECS=6                    # force re-bases mid-call
+export FLOWCAT_CONTEXT_RELAY_SUMMARIZER=openai/gpt-4o-mini         # optional: LLM summary
+# build with the realtime-openai (or realtime-grok) connector feature enabled
+cargo run -p flowcat-server --features webrtc,flowcat-services/realtime-openai -- --config agent.yaml
+```
+Reseeds log as `context-relay: re-basing realtime session onto text digest`. On the
+OpenAI family a re-base reopens the socket (drops the audio history); on Gemini it
+reconnects with a fresh setup — both carry the text digest into the new session.
 
 ## Sources
 
+- OpenAI API pricing (gpt-realtime-2) — https://developers.openai.com/api/docs/pricing
+- OpenAI Realtime cost guide (audio token metering) — https://developers.openai.com/api/docs/guides/realtime-costs
+- xAI models / pricing (Grok Realtime per-minute) — https://docs.x.ai/developers/models
 - Gemini Live API best practices — https://ai.google.dev/gemini-api/docs/live-api/best-practices
 - Gemini Live API capabilities — https://ai.google.dev/gemini-api/docs/live-api/capabilities
 - Gemini Live session management — https://ai.google.dev/gemini-api/docs/live-session

@@ -156,6 +156,13 @@ impl crate::processor::frame::CustomFrame for ToolResult {
 pub(crate) struct Reprompt {
     pub(crate) prompt: String,
     pub(crate) tools: Vec<ToolDecl>,
+    /// `true` ⇒ this is a **ContextRelay re-base**: the prior audio conversation has
+    /// been folded into `prompt` as text, so the realtime service must DROP the
+    /// accumulated audio context (`rebase_session`) rather than keep it
+    /// (`update_system`). `false` ⇒ an ordinary graph-transition re-prompt that
+    /// swaps the prompt while keeping the conversation in place. Defaults to `false`
+    /// for every non-relay producer (a brain transition).
+    pub(crate) rebase: bool,
 }
 
 impl crate::processor::frame::CustomFrame for Reprompt {
@@ -715,12 +722,21 @@ impl<R: RealtimeLlm + RealtimeKickoff + 'static> FrameProcessor for RealtimeServ
                 }
             }
 
-            // Upstream re-prompt from the brain → update_system (call.rs's
-            // realtime.update_system call on a transition).
+            // Upstream re-prompt from the brain or ContextRelay. An ordinary
+            // transition (`rebase=false`) swaps prompt+tools in place via
+            // `update_system`; a ContextRelay re-base (`rebase=true`) folds the prior
+            // audio into the text `prompt` and calls `rebase_session` so the backend
+            // DROPS the accumulated audio history (call.rs's update_system call on a
+            // transition, plus the §10 re-base extension).
             Frame::Custom(c) if c.as_any().is::<Reprompt>() => {
                 let rp = c.as_any().downcast_ref::<Reprompt>().unwrap();
                 let mut rt = self.realtime.lock().await;
-                if let Err(e) = rt.update_system(rp.prompt.clone(), rp.tools.clone()).await {
+                let res = if rp.rebase {
+                    rt.rebase_session(rp.prompt.clone(), rp.tools.clone()).await
+                } else {
+                    rt.update_system(rp.prompt.clone(), rp.tools.clone()).await
+                };
+                if let Err(e) = res {
                     drop(rt);
                     self.state.lock().unwrap().record_error(e);
                 }
@@ -913,6 +929,9 @@ impl<B: AgentBrain + 'static, Rl: ToolRelay + 'static> FrameProcessor for BrainP
                 link.push_up(Frame::Custom(Arc::new(Reprompt {
                     prompt: system_prompt,
                     tools,
+                    // A graph transition keeps the conversation in place (in-session
+                    // update); only ContextRelay re-bases drop the audio history.
+                    rebase: false,
                 })))
                 .await;
                 link.push_up(Frame::Custom(Arc::new(ToolResult {
@@ -2197,6 +2216,41 @@ mod tests {
         );
         // The node's tool set rides along unchanged.
         assert!(rebased.1.iter().any(|n| n == END_TOOL));
+    }
+
+    /// The compaction must route through the realtime backend's **`rebase_session`**
+    /// seam (the audio-dropping reopen), NOT plain `update_system` — that distinction
+    /// is what makes the relay actually evict audio on the OpenAI-protocol family
+    /// (whose `update_system` is an in-session, history-keeping update).
+    #[tokio::test]
+    async fn context_relay_compaction_routes_through_rebase_session() {
+        let seen = SeenPrompts::default();
+        let rebases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s2s = build_s2s_task_with_observers(
+            relay_transport(),
+            CapturingRealtime::with_rebase_counter(seen.clone(), rebases.clone(), relay_script()),
+            MockBrain::new(Arc::new(Mutex::new(Vec::new()))),
+            MockSession::new(Arc::new(Mutex::new(Captured::default()))),
+            4242,
+            "tok-abc".into(),
+            TEST_MODEL.into(),
+            Some(relay_config()),
+            vec![],
+        )
+        .await
+        .expect("build_s2s_task_with_observers");
+        tokio::time::timeout(Duration::from_secs(5), s2s.run())
+            .await
+            .expect("S2S pipeline timed out")
+            .expect("S2S pipeline errored");
+
+        // The budget-busting turn drove at least one re-base through `rebase_session`
+        // — the MockBrain has no graph transitions, so every re-base here is the
+        // relay's compaction (none came from an ordinary `update_system` transition).
+        assert!(
+            rebases.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "compaction must call rebase_session (audio-dropping reopen), not update_system"
+        );
     }
 
     #[tokio::test]

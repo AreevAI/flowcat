@@ -10,7 +10,7 @@
 //! in `pipeline/mod.rs`, so it never ships in a non-test build.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -529,14 +529,29 @@ pub(crate) struct CapturingRealtime {
     kicked_off: Arc<AtomicBool>,
     /// `(prompt, tool-names)` for `connect` then each `update_system`, in order.
     seen: SeenPrompts,
+    /// Count of `rebase_session` calls (the audio-dropping re-base path) — distinct
+    /// from `update_system` (in-session). Lets a test assert that the relay's
+    /// compaction routes through the re-base seam, while a graph transition does not.
+    rebases: Arc<AtomicUsize>,
     script: VecDeque<RealtimeEvent>,
 }
 
 impl CapturingRealtime {
     pub(crate) fn new(seen: SeenPrompts, script: Vec<RealtimeEvent>) -> Self {
+        Self::with_rebase_counter(seen, Arc::new(AtomicUsize::new(0)), script)
+    }
+
+    /// Like [`new`](Self::new) but with a caller-held `rebases` counter so a test can
+    /// assert how many `rebase_session` (vs `update_system`) calls occurred.
+    pub(crate) fn with_rebase_counter(
+        seen: SeenPrompts,
+        rebases: Arc<AtomicUsize>,
+        script: Vec<RealtimeEvent>,
+    ) -> Self {
         Self {
             kicked_off: Arc::new(AtomicBool::new(false)),
             seen,
+            rebases,
             script: script.into(),
         }
     }
@@ -566,6 +581,18 @@ impl RealtimeLlm for CapturingRealtime {
             .unwrap()
             .push((prompt, tools.iter().map(|t| t.name.clone()).collect()));
         Ok(())
+    }
+
+    async fn rebase_session(
+        &mut self,
+        prompt: String,
+        tools: Vec<ToolDecl>,
+    ) -> Result<(), FlowcatError> {
+        // Tally the re-base, then record the prompt the same way `update_system`
+        // does — so existing digest-content assertions over `seen` are unchanged and
+        // a new test can additionally assert the count of re-base calls.
+        self.rebases.fetch_add(1, Ordering::SeqCst);
+        self.update_system(prompt, tools).await
     }
 
     async fn send_tool_result(
