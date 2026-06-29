@@ -138,11 +138,40 @@ impl RollingContext {
         self.tools = tools;
     }
 
+    /// Record the `assistant` message that made a tool call, so the following
+    /// `tool` result has a valid preceding `tool_calls` to answer. OpenAI
+    /// chat-completions rejects a `tool` message that is not a response to a
+    /// prior assistant message carrying `tool_calls` (`400`: "a message with
+    /// role 'tool' must be a response to a preceding message with 'tool_calls'").
+    /// `arguments` is serialized to the JSON **string** the API expects.
+    fn push_assistant_tool_call(&mut self, tool_call_id: &str, name: &str, arguments: &Value) {
+        let arguments = match arguments {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        self.messages.push(json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments },
+            }],
+        }));
+    }
+
     /// Append a workflow (MCP/HTTP) **tool result** to the rolling history as a
     /// `tool` message so the re-run LLM sees the result and continues the turn
-    /// (the cascaded analogue of the realtime `send_tool_result`). The content is
-    /// stored verbatim (a bare string, matching the brain's relay contract).
+    /// (the cascaded analogue of the realtime `send_tool_result`). OpenAI requires
+    /// a `tool` message's `content` to be a **string** (or array of content
+    /// parts); the brain relays the raw MCP result, which is usually a JSON object
+    /// (e.g. `{"departments": […]}`) — sending that verbatim 400s with
+    /// `invalid_type`. So a non-string result is serialized to a JSON string.
     fn push_tool_result(&mut self, tool_call_id: &str, content: &Value) {
+        let content = match content {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -754,11 +783,20 @@ struct CascadedToolBridge {
     /// The shared rolling LLM context (also held by the user/assistant aggregators),
     /// updated on transitions + tool results.
     ctx: SharedContext,
+    /// In-flight tool calls (`tool_call_id → (name, arguments)`), recorded when the
+    /// LLM emits [`Frame::FunctionCallsStarted`] and consumed when the matching
+    /// [`ToolResult`] returns — so the rolling context can record the
+    /// `assistant`+`tool_calls` turn OpenAI requires before the `tool` result.
+    /// Transition/end ACKs drop their entry without emitting a tool message.
+    pending: std::collections::HashMap<String, (String, Value)>,
 }
 
 impl CascadedToolBridge {
     fn new(ctx: SharedContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            pending: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -776,6 +814,12 @@ impl FrameProcessor for CascadedToolBridge {
             // (don't forward it past the brain into the assistant aggregator / TTS).
             Frame::FunctionCallsStarted(calls) => {
                 for c in calls {
+                    // Track the call so its result can be paired into a valid
+                    // assistant→tool_calls→tool exchange when it returns.
+                    self.pending.insert(
+                        c.tool_call_id.clone(),
+                        (c.function_name.clone(), c.arguments.clone()),
+                    );
                     link.push_down(Frame::Custom(Arc::new(ModelToolCall {
                         id: c.tool_call_id.clone(),
                         name: c.function_name.clone(),
@@ -818,10 +862,21 @@ impl FrameProcessor for CascadedToolBridge {
                 if !is_transition_ack(&tr.result) {
                     let snapshot = {
                         let mut ctx = self.ctx.lock().unwrap();
+                        // Record the assistant `tool_calls` turn (if we tracked it)
+                        // so the tool result has a valid call to answer, then the
+                        // result itself, then re-run for the continuation.
+                        if let Some((name, args)) = self.pending.remove(&tr.id) {
+                            ctx.push_assistant_tool_call(&tr.id, &name, &args);
+                        }
                         ctx.push_tool_result(&tr.id, &tr.result);
                         ctx.snapshot()
                     };
                     link.push_up(Frame::LlmContext(Arc::new(snapshot))).await;
+                } else {
+                    // Transition/stay/end ACK — no `tool` message is appended (the
+                    // transition re-runs via its paired Reprompt); drop the tracked
+                    // call so it can't leave a dangling `tool_calls`.
+                    self.pending.remove(&tr.id);
                 }
             }
 
@@ -1998,5 +2053,50 @@ mod tests {
         assert!(!is_transition_ack(&json!({ "booking_id": "B1" })));
         assert!(!is_transition_ack(&json!({ "status": 200 })));
         assert!(!is_transition_ack(&json!("moved")));
+    }
+
+    // ---- tool-call exchange shape: the OpenAI chat-completions contract --------
+    // A `tool` message must (a) have STRING content and (b) follow an `assistant`
+    // message carrying matching `tool_calls`. The live cascaded bug was an object
+    // content (`400 invalid_type`) with no preceding `tool_calls`.
+
+    #[test]
+    fn tool_exchange_records_assistant_tool_call_then_string_result() {
+        let mut ctx = RollingContext::new(None, vec![]);
+        ctx.push_assistant_tool_call("call_1", "list_departments", &json!({ "q": "cardio" }));
+        ctx.push_tool_result("call_1", &json!({ "departments": ["cardiology"] }));
+        let snap = ctx.snapshot();
+
+        // (a) assistant turn records the tool call; arguments are a JSON STRING.
+        assert_eq!(snap.messages[0]["role"], "assistant");
+        assert_eq!(snap.messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            snap.messages[0]["tool_calls"][0]["function"]["name"],
+            "list_departments"
+        );
+        assert!(
+            snap.messages[0]["tool_calls"][0]["function"]["arguments"].is_string(),
+            "OpenAI requires tool-call arguments to be a JSON string"
+        );
+
+        // (b) the tool result follows it with STRING content (object serialized).
+        assert_eq!(snap.messages[1]["role"], "tool");
+        assert_eq!(snap.messages[1]["tool_call_id"], "call_1");
+        assert!(
+            snap.messages[1]["content"].is_string(),
+            "object tool result must be serialized to a string, not sent as an object"
+        );
+        assert!(snap.messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("cardiology"));
+    }
+
+    #[test]
+    fn string_tool_result_passes_through_unchanged() {
+        let mut ctx = RollingContext::new(None, vec![]);
+        ctx.push_tool_result("call_2", &json!("already a string"));
+        let snap = ctx.snapshot();
+        assert_eq!(snap.messages[0]["content"], "already a string");
     }
 }
