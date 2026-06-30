@@ -61,6 +61,7 @@ use crate::brain::AgentBrain;
 use crate::codec::Resampler;
 use crate::error::{FlowcatError, Result};
 use crate::processor::frame::{AudioFrame, Frame, FrameClass, StartParams};
+use crate::processor::metrics::MetricsData;
 use crate::processor::{Envelope, FrameProcessor, Link, ProcessorSetup, StopReason};
 use crate::realtime::{RealtimeKickoff, RealtimeLlm};
 use crate::session::SessionSource;
@@ -1131,9 +1132,26 @@ impl FrameProcessor for RecorderProcessor {
                 self.state.lock().unwrap().recorder.push_inbound(&chunk);
             }
             // Usage report — fold into the shared LiveState (call.rs accumulate_usage).
+            // The realtime path emits this `Custom(UsageReport)` from its provider event.
             Frame::Custom(c) if c.as_any().is::<UsageReport>() => {
                 let u = c.as_any().downcast_ref::<UsageReport>().unwrap();
                 self.state.lock().unwrap().accumulate_usage(&u.0);
+            }
+            // The cascaded LLM leg reports token usage as `Frame::Metrics(LlmUsage)`
+            // (the OpenAI/`include_usage` trailing chunk). Fold the same way so a
+            // cascaded call's run gets non-zero input/output tokens, just like realtime.
+            Frame::Metrics(items) => {
+                for m in items {
+                    if let MetricsData::LlmUsage { tokens, .. } = m {
+                        let usage = Usage {
+                            input_tokens: Some(tokens.prompt_tokens),
+                            output_tokens: Some(tokens.completion_tokens),
+                            total_tokens: Some(tokens.total_tokens),
+                            extra: None,
+                        };
+                        self.state.lock().unwrap().accumulate_usage(&usage);
+                    }
+                }
             }
             _ => {}
         }

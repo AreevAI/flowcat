@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use flowcat_core::error::{FlowcatError, Result};
 use flowcat_core::processor::frame::{Frame, FunctionCall, LlmContext, StartParams};
+use flowcat_core::processor::metrics::{LlmTokenUsage, MetricsData};
 use flowcat_core::service::{LlmService, Tool};
 
 /// OpenAI's default API base. A `base_url` override points the same client at
@@ -95,6 +96,9 @@ impl OpenAiLlm {
             "model": self.model,
             "messages": ctx.messages,
             "stream": true,
+            // Ask for the trailing usage chunk so the cascaded leg can report LLM
+            // token usage (parsed in `accumulate`, emitted as `Frame::Metrics`).
+            "stream_options": { "include_usage": true },
         });
         // Tools: prefer the context's, else the service-level set. OpenAI wants
         // each tool as `{ "type": "function", "function": { name, description,
@@ -159,7 +163,9 @@ impl LlmService for OpenAiLlm {
         // Build an owned byte stream so the returned frame stream does not borrow
         // `self` (only the connection/body, which the stream owns). The SSE
         // bytes are buffered line-by-line and mapped to frames as they arrive.
-        Ok(sse_to_frames(resp.bytes_stream()))
+        // The model name is cloned in so the trailing usage chunk can be reported
+        // as `Frame::Metrics(LlmUsage { model, … })`.
+        Ok(sse_to_frames(resp.bytes_stream(), self.model.clone()))
     }
 
     fn set_tools(&mut self, tools: Vec<Tool>) {
@@ -174,12 +180,18 @@ struct SseState {
     finished: bool,
     pending: std::collections::VecDeque<Frame>,
     tool_acc: BTreeMap<u64, ToolAcc>,
+    /// The model name, echoed into the emitted `LlmUsage` metric.
+    model: String,
+    /// Token usage from the trailing `{"usage": …}` chunk (present only when the
+    /// request set `stream_options.include_usage`). Emitted on [`finish`].
+    usage: Option<LlmTokenUsage>,
 }
 
 impl SseState {
     /// Flush the end-of-response frames into `pending` once: emit
     /// `LlmResponseStart` first if the stream produced nothing, then any
-    /// assembled tool calls (`FunctionCallsStarted`), then `LlmResponseEnd`.
+    /// assembled tool calls (`FunctionCallsStarted`), then the LLM token-usage
+    /// metric (if the trailing usage chunk arrived), then `LlmResponseEnd`.
     fn finish(&mut self) {
         if self.finished {
             return;
@@ -192,7 +204,37 @@ impl SseState {
         if let Some(f) = drain_tool_calls(&mut self.tool_acc) {
             self.pending.push_back(f);
         }
+        if let Some(tokens) = self.usage.take() {
+            self.pending
+                .push_back(Frame::Metrics(vec![MetricsData::LlmUsage {
+                    processor: "openai".to_string(),
+                    model: Some(self.model.clone()),
+                    tokens,
+                }]));
+        }
         self.pending.push_back(Frame::LlmResponseEnd);
+    }
+}
+
+/// Parse an OpenAI streaming `usage` object into [`LlmTokenUsage`]. The trailing
+/// chunk (when `stream_options.include_usage` is set) carries
+/// `{prompt_tokens, completion_tokens, total_tokens, …}` with an empty `choices`.
+fn parse_usage(usage: &Value) -> LlmTokenUsage {
+    let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let opt = |path: &[&str]| -> Option<u64> {
+        let mut cur = usage;
+        for k in path {
+            cur = cur.get(k)?;
+        }
+        cur.as_u64()
+    };
+    LlmTokenUsage {
+        prompt_tokens: get("prompt_tokens"),
+        completion_tokens: get("completion_tokens"),
+        total_tokens: get("total_tokens"),
+        cache_read_input_tokens: opt(&["prompt_tokens_details", "cached_tokens"]),
+        cache_creation_input_tokens: None,
+        reasoning_tokens: opt(&["completion_tokens_details", "reasoning_tokens"]),
     }
 }
 
@@ -201,7 +243,7 @@ impl SseState {
 /// `LlmResponseEnd`. Owns the body stream so it doesn't borrow the service.
 /// Generic over the chunk type (`AsRef<[u8]>`) so we don't name `bytes::Bytes`
 /// (no extra dep).
-fn sse_to_frames<S, B, E>(byte_stream: S) -> BoxStream<'static, Frame>
+fn sse_to_frames<S, B, E>(byte_stream: S, model: String) -> BoxStream<'static, Frame>
 where
     S: futures::Stream<Item = std::result::Result<B, E>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
@@ -214,6 +256,8 @@ where
         finished: false,
         pending: std::collections::VecDeque::new(),
         tool_acc: BTreeMap::new(),
+        model,
+        usage: None,
     };
     stream::unfold((inner, st), |(mut inner, mut st)| async move {
         loop {
@@ -237,6 +281,12 @@ where
                                 if !st.started {
                                     st.started = true;
                                     st.pending.push_back(Frame::LlmResponseStart);
+                                }
+                                // The trailing `include_usage` chunk carries a
+                                // top-level `usage` (and an empty `choices`); stash
+                                // it to emit on finish.
+                                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                                    st.usage = Some(parse_usage(u));
                                 }
                                 accumulate(&v, &mut st.tool_acc, &mut st.pending);
                             }
@@ -479,6 +529,66 @@ mod tests {
             }
             other => panic!("expected FunctionCallsStarted, got {}", other.name()),
         }
+    }
+
+    #[test]
+    fn request_body_asks_for_include_usage() {
+        let llm = OpenAiLlm::new("k");
+        let ctx = LlmContext {
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            tools: vec![],
+        };
+        let body = llm.request_body(&ctx);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parse_usage_maps_openai_token_fields() {
+        let u = json!({
+            "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19,
+            "prompt_tokens_details": { "cached_tokens": 4 },
+            "completion_tokens_details": { "reasoning_tokens": 3 }
+        });
+        let t = parse_usage(&u);
+        assert_eq!(t.prompt_tokens, 12);
+        assert_eq!(t.completion_tokens, 7);
+        assert_eq!(t.total_tokens, 19);
+        assert_eq!(t.cache_read_input_tokens, Some(4));
+        assert_eq!(t.reasoning_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_emits_llm_usage_metric_from_trailing_chunk() {
+        // A text delta, then the `include_usage` trailing chunk (empty `choices`,
+        // top-level `usage`), then `[DONE]`. The cascaded leg must surface the
+        // usage as `Frame::Metrics(LlmUsage)` so the run records tokens.
+        let chunks: Vec<std::result::Result<Vec<u8>, std::convert::Infallible>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let mut frames = sse_to_frames(stream::iter(chunks), "gpt-4o".to_string());
+        let mut saw_text = false;
+        let mut usage = None;
+        while let Some(f) = frames.next().await {
+            match f {
+                Frame::LlmText(_) => saw_text = true,
+                Frame::Metrics(items) => {
+                    for m in items {
+                        if let MetricsData::LlmUsage { model, tokens, .. } = m {
+                            usage = Some((model, tokens));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_text, "text delta still streams");
+        let (model, tokens) = usage.expect("a usage metric is emitted");
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+        assert_eq!(tokens.prompt_tokens, 12);
+        assert_eq!(tokens.completion_tokens, 7);
+        assert_eq!(tokens.total_tokens, 19);
     }
 
     /// Live smoke (requires `OPENAI_API_KEY`): stream a one-token reply. Run:
