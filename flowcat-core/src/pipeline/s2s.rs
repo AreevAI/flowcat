@@ -198,6 +198,14 @@ pub(crate) struct LiveState {
     /// Count of REAL workflow tool calls relayed this call (not transitions) —
     /// reported as `usage_metrics.tool_calls` for the Run-detail "Tool Calls" metric.
     pub(crate) tool_calls: u64,
+    /// Characters synthesized by the cascaded TTS leg this call, summed across
+    /// utterances. Surfaced flat as `usage_metrics.tts_characters`; the control
+    /// plane wraps it under the TTS `provider|||model` and prices it per-1k-chars.
+    tts_characters: u64,
+    /// Audio seconds fed to the cascaded STT leg this call. Surfaced flat as
+    /// `usage_metrics.stt_audio_seconds`; the control plane wraps it under the STT
+    /// `provider|||model` and prices it per-minute.
+    stt_audio_seconds: f64,
     error: Option<FlowcatError>,
     /// Set once a terminal transport error is seen (peer gone). De-dupes the log
     /// (warn once, not per buffered frame) and lets the sink stop sending / end the call.
@@ -213,6 +221,8 @@ impl LiveState {
             collected_vars: serde_json::Value::Null,
             usage: Usage::default(),
             tool_calls: 0,
+            tts_characters: 0,
+            stt_audio_seconds: 0.0,
             error: None,
             transport_dead: false,
         }
@@ -260,6 +270,21 @@ impl LiveState {
                 .or_insert_with(|| serde_json::json!(self.transcript.bot_turns()));
             map.entry("tool_calls".to_string())
                 .or_insert_with(|| serde_json::json!(self.tool_calls));
+            // Cascaded TTS characters synthesized (flat) — the control plane wraps
+            // this under the TTS provider|||model and prices it. Omitted when none
+            // (realtime has no separate TTS leg).
+            if self.tts_characters > 0 {
+                map.entry("tts_characters".to_string())
+                    .or_insert_with(|| serde_json::json!(self.tts_characters));
+            }
+            // Cascaded STT audio seconds (flat, rounded) — wrapped + priced per-minute
+            // by the control plane. Omitted when none (realtime has no separate STT leg).
+            if self.stt_audio_seconds > 0.0 {
+                map.entry("stt_audio_seconds".to_string())
+                    .or_insert_with(|| {
+                        serde_json::json!((self.stt_audio_seconds * 100.0).round() / 100.0)
+                    });
+            }
         }
         v
     }
@@ -1142,14 +1167,25 @@ impl FrameProcessor for RecorderProcessor {
             // cascaded call's run gets non-zero input/output tokens, just like realtime.
             Frame::Metrics(items) => {
                 for m in items {
-                    if let MetricsData::LlmUsage { tokens, .. } = m {
-                        let usage = Usage {
-                            input_tokens: Some(tokens.prompt_tokens),
-                            output_tokens: Some(tokens.completion_tokens),
-                            total_tokens: Some(tokens.total_tokens),
-                            extra: None,
-                        };
-                        self.state.lock().unwrap().accumulate_usage(&usage);
+                    match m {
+                        MetricsData::LlmUsage { tokens, .. } => {
+                            let usage = Usage {
+                                input_tokens: Some(tokens.prompt_tokens),
+                                output_tokens: Some(tokens.completion_tokens),
+                                total_tokens: Some(tokens.total_tokens),
+                                extra: None,
+                            };
+                            self.state.lock().unwrap().accumulate_usage(&usage);
+                        }
+                        // Cascaded TTS leg reports synthesized characters → cost.
+                        MetricsData::TtsUsage { characters, .. } => {
+                            self.state.lock().unwrap().tts_characters += characters;
+                        }
+                        // Cascaded STT leg reports audio seconds transcribed → cost.
+                        MetricsData::SttUsage { audio_seconds, .. } => {
+                            self.state.lock().unwrap().stt_audio_seconds += audio_seconds;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2034,11 +2070,24 @@ mod tests {
             total_tokens: Some(6),
             extra: Some(json!({ "cached": 3 })),
         });
+        // No TTS/STT usage yet → the cost keys are omitted (not a misleading 0).
+        assert!(st.usage_json().get("tts_characters").is_none());
+        assert!(st.usage_json().get("stt_audio_seconds").is_none());
         // Run-detail observability counts ride in the same usage object.
         st.transcript.push_user("hi");
         st.transcript.push_bot("hello");
         st.tool_calls = 2;
+        st.tts_characters = 137; // cascaded TTS leg synthesized 137 chars
+        st.stt_audio_seconds = 42.555; // cascaded STT transcribed 42.555s of audio
         let u = st.usage_json();
+        assert_eq!(
+            u["tts_characters"], 137,
+            "synthesized chars surfaced for billing"
+        );
+        assert_eq!(
+            u["stt_audio_seconds"], 42.56,
+            "audio seconds surfaced (2dp)"
+        );
         assert_eq!(u["input_tokens"], 15);
         assert_eq!(u["output_tokens"], 3);
         assert_eq!(u["total_tokens"], 18);

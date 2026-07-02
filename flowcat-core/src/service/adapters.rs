@@ -48,6 +48,7 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::processor::frame::{Frame, LlmContext, ServiceKind, StartParams};
+use crate::processor::metrics::MetricsData;
 use crate::processor::{Envelope, FrameProcessor, Link, ProcessorSetup};
 use crate::service::{LlmService, SttService, TtsService};
 
@@ -62,6 +63,10 @@ pub struct SttProcessor<S: SttService> {
     /// The wrapped STT service (shared so a provider impl can also drive its own
     /// internal streaming reader from the same handle).
     svc: Arc<Mutex<S>>,
+    /// Audio seconds forwarded to STT since the last `SttUsage` flush. Flushed
+    /// each ~1s as a `Frame::Metrics(SttUsage)` so the recorder can fold it into
+    /// `usage_metrics` for per-minute billing.
+    pending_audio_seconds: f64,
 }
 
 impl<S: SttService> SttProcessor<S> {
@@ -69,6 +74,7 @@ impl<S: SttService> SttProcessor<S> {
     pub fn new(svc: S) -> Self {
         Self {
             svc: Arc::new(Mutex::new(svc)),
+            pending_audio_seconds: 0.0,
         }
     }
 }
@@ -92,6 +98,19 @@ impl<S: SttService + 'static> FrameProcessor for SttProcessor<S> {
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         match &env.frame {
             Frame::InputAudio(audio) => {
+                // Accrue the audio duration fed to STT (the billable basis for
+                // per-minute streaming STT); flush as an `SttUsage` metric each ~1s.
+                let channels = audio.num_channels.max(1) as f64;
+                self.pending_audio_seconds +=
+                    audio.pcm.len() as f64 / channels / audio.sample_rate.max(1) as f64;
+                if self.pending_audio_seconds >= 1.0 {
+                    link.push_down(Frame::Metrics(vec![MetricsData::SttUsage {
+                        processor: "stt".to_string(),
+                        audio_seconds: self.pending_audio_seconds,
+                    }]))
+                    .await;
+                    self.pending_audio_seconds = 0.0;
+                }
                 // Bounded round-trip: the (streaming) provider impl returns whatever
                 // its internal reader has decoded. Await it so the produced frames
                 // are enqueued downstream in order before the next frame is handled.
@@ -258,6 +277,15 @@ impl<T: TtsService> TtsProcessor<T> {
         match frames {
             Ok(frames) => {
                 tracing::debug!(frames = frames.len(), "cascaded TTS produced frames");
+                // Report characters synthesized for cost accounting. Count Unicode
+                // chars (not byte len) so multilingual text (Hindi/Telugu) bills
+                // correctly. Emitted only on success (a failed synth bills nothing);
+                // folded by the recorder into usage_metrics, priced per-1k-chars.
+                link.push_down(Frame::Metrics(vec![MetricsData::TtsUsage {
+                    processor: "tts".to_string(),
+                    characters: text.chars().count() as u64,
+                }]))
+                .await;
                 for f in frames {
                     let f = match f {
                         // Map TtsAudio → OutputAudio so a transport-out sink plays it.

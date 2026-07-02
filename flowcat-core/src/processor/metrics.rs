@@ -31,6 +31,11 @@ pub enum MetricsData {
     },
     /// TTS character usage (`metrics.py:78`).
     TtsUsage { processor: String, characters: u64 },
+    /// STT audio usage — seconds of audio transcribed (billed per-minute).
+    SttUsage {
+        processor: String,
+        audio_seconds: f64,
+    },
     /// End-of-turn prediction metric (`metrics.py:101`).
     TurnPrediction {
         processor: String,

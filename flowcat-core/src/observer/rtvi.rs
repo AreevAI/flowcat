@@ -506,8 +506,9 @@ fn map_metrics(data: &[MetricsData]) -> Option<RtviMessage> {
                 processor,
                 characters: chars,
             } => characters.push(json!({ "processor": processor, "value": chars })),
-            // Turn-prediction has no RTVI metrics bucket in pipecat — skip.
-            MetricsData::TurnPrediction { .. } => {}
+            // No RTVI metrics bucket for these in pipecat — skip (STT seconds is a
+            // billing metric folded by the recorder, not an RTVI stream value).
+            MetricsData::SttUsage { .. } | MetricsData::TurnPrediction { .. } => {}
         }
     }
 

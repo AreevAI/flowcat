@@ -363,6 +363,7 @@ fn metric_processor(d: &MetricsData) -> &str {
         | MetricsData::Processing { processor, .. }
         | MetricsData::LlmUsage { processor, .. }
         | MetricsData::TtsUsage { processor, .. }
+        | MetricsData::SttUsage { processor, .. }
         | MetricsData::TurnPrediction { processor, .. } => processor,
     }
 }
