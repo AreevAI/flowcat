@@ -241,6 +241,16 @@ fn metric_span(d: &MetricsData) -> OtelSpan {
                 KeyValue::new("turn.e2e_processing_ms", *e2e_processing_ms),
             ],
         ),
+        MetricsData::SttUsage {
+            processor,
+            audio_seconds,
+        } => OtelSpan::new(
+            "metrics.stt_usage",
+            vec![
+                KeyValue::new("processor", processor.clone()),
+                KeyValue::new("metrics.audio_seconds", *audio_seconds),
+            ],
+        ),
     }
 }
 
