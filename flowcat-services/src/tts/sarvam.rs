@@ -106,13 +106,15 @@ impl TtsService for SarvamTts {
     async fn run_tts(&mut self, text: &str) -> Result<Vec<Frame>> {
         self.ctx_counter += 1;
         let context_id: Arc<str> = Arc::from(format!("ctx-{}", self.ctx_counter));
-        let body = build_body(
-            text,
-            &self.language,
-            &self.speaker,
-            &self.model,
-            self.sample_rate,
-        );
+        // `auto` resolves the target language PER UTTERANCE from the text's
+        // script (Sarvam's API itself has no auto-detect) — one session can
+        // speak Tamil, Hindi, and English replies back-to-back.
+        let language = if self.language == "auto" {
+            language_for_text(text)
+        } else {
+            self.language.as_str()
+        };
+        let body = build_body(text, language, &self.speaker, &self.model, self.sample_rate);
         let req = HttpTtsRequest {
             url: self.url(),
             headers: vec![("api-subscription-key".to_string(), self.api_key.clone())],
@@ -121,6 +123,43 @@ impl TtsService for SarvamTts {
         let raw = self.client.post(req).await?;
         let pcm = decode_response(&raw);
         Ok(tts_frames(pcm, self.sample_rate, context_id))
+    }
+}
+
+/// Pick the Bulbul `target_language_code` for an utterance from its dominant
+/// Indic script (pure seam; used when the service language is `auto`).
+///
+/// Counts characters per Unicode block and returns the majority script's code;
+/// text with no Indic characters (Latin, digits, punctuation) → `en-IN`.
+/// Devanagari maps to `hi-IN` — Marathi shares the script and cannot be told
+/// apart without a language model, so `auto` speakers reading Marathi should pin
+/// `mr-IN` instead.
+pub fn language_for_text(text: &str) -> &'static str {
+    // (block-range, code) per Bulbul-supported script.
+    const BLOCKS: &[(std::ops::RangeInclusive<u32>, &str)] = &[
+        (0x0900..=0x097F, "hi-IN"), // Devanagari (Hindi/Marathi)
+        (0x0980..=0x09FF, "bn-IN"), // Bengali
+        (0x0A00..=0x0A7F, "pa-IN"), // Gurmukhi (Punjabi)
+        (0x0A80..=0x0AFF, "gu-IN"), // Gujarati
+        (0x0B00..=0x0B7F, "od-IN"), // Odia
+        (0x0B80..=0x0BFF, "ta-IN"), // Tamil
+        (0x0C00..=0x0C7F, "te-IN"), // Telugu
+        (0x0C80..=0x0CFF, "kn-IN"), // Kannada
+        (0x0D00..=0x0D7F, "ml-IN"), // Malayalam
+    ];
+    let mut counts = [0usize; 9];
+    for c in text.chars() {
+        let cp = c as u32;
+        for (i, (range, _)) in BLOCKS.iter().enumerate() {
+            if range.contains(&cp) {
+                counts[i] += 1;
+                break;
+            }
+        }
+    }
+    match counts.iter().enumerate().max_by_key(|(_, &n)| n) {
+        Some((i, &n)) if n > 0 => BLOCKS[i].1,
+        _ => "en-IN",
     }
 }
 
@@ -163,6 +202,25 @@ pub fn decode_response(body: &[u8]) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_for_text_picks_the_dominant_script() {
+        assert_eq!(language_for_text("வணக்கம், எப்படி இருக்கீங்க?"), "ta-IN");
+        assert_eq!(language_for_text("नमस्ते, आप कैसे हैं?"), "hi-IN");
+        assert_eq!(language_for_text("নমস্কার"), "bn-IN");
+        assert_eq!(language_for_text("ਸਤ ਸ੍ਰੀ ਅਕਾਲ"), "pa-IN");
+        assert_eq!(language_for_text("કેમ છો"), "gu-IN");
+        assert_eq!(language_for_text("ନମସ୍କାର"), "od-IN");
+        assert_eq!(language_for_text("నమస్కారం"), "te-IN");
+        assert_eq!(language_for_text("ನಮಸ್ಕಾರ"), "kn-IN");
+        assert_eq!(language_for_text("നമസ്കാരം"), "ml-IN");
+        // Latin / empty / punctuation-only → English (India).
+        assert_eq!(language_for_text("Hello, how are you?"), "en-IN");
+        assert_eq!(language_for_text(""), "en-IN");
+        assert_eq!(language_for_text("299!?"), "en-IN");
+        // Code-mixed: the DOMINANT script wins ("recharge" inside a Tamil reply).
+        assert_eq!(language_for_text("உங்க recharge plan ரெடி!"), "ta-IN");
+    }
 
     #[test]
     fn body_matches_sarvam_schema() {

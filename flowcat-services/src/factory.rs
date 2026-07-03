@@ -176,7 +176,19 @@ pub fn stt(spec: &ProviderSpec) -> Result<Box<dyn SttService>, FlowcatError> {
             }))
         }
         #[cfg(feature = "stt-sarvam")]
-        "sarvam" => Ok(Box::new(crate::stt::SarvamStt::new(key))),
+        "sarvam" => {
+            // Honor the pinned model (`saarika:v2.5` vs `saaras:v2.5`) and the
+            // `language` option (BCP-47, e.g. `hi-IN`; absent → auto-detect).
+            let mut c = crate::stt::SarvamStt::new(key);
+            if !spec.model.is_empty() {
+                c = c.model(&spec.model);
+            }
+            let language = spec.opt("language");
+            if !language.is_empty() {
+                c = c.language(language);
+            }
+            Ok(Box::new(c))
+        }
         #[cfg(feature = "stt-openai")]
         "openai" | "whisper" => Ok(Box::new(crate::stt::OpenAiStt::new(key))),
         #[cfg(feature = "stt-groq")]
@@ -277,7 +289,22 @@ pub fn tts(spec: &ProviderSpec) -> Result<Box<dyn TtsService>, FlowcatError> {
         #[cfg(feature = "tts-openai")]
         "openai" => Ok(Box::new(crate::tts::OpenAiTts::new(key, voice))),
         #[cfg(feature = "tts-sarvam")]
-        "sarvam" => Ok(Box::new(crate::tts::SarvamTts::new(key, voice))),
+        "sarvam" => {
+            // `spec.model` is the voice (speaker); the actual Bulbul model and
+            // the `target_language_code` ride as options (`model`, `language`) —
+            // Sarvam rejects synthesis without a real language code, so the
+            // caller should pass one (default `en-IN`).
+            let mut c = crate::tts::SarvamTts::new(key, voice);
+            let model = spec.opt("model");
+            if !model.is_empty() {
+                c = c.model(model);
+            }
+            let language = spec.opt("language");
+            if !language.is_empty() {
+                c = c.language(language);
+            }
+            Ok(Box::new(c))
+        }
         #[cfg(feature = "tts-hume")]
         "hume" => Ok(Box::new(crate::tts::HumeTts::new(key, voice))),
         #[cfg(feature = "tts-inworld")]
@@ -651,6 +678,24 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("no llm provider configured"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(all(feature = "stt-sarvam", feature = "tts-sarvam"))]
+    fn sarvam_builds_with_and_without_model_language_options() {
+        // Bare spec (host defaults: saarika:v2.5 / bulbul:v2 / en-IN).
+        assert!(stt(&spec("sarvam", "k")).is_ok());
+        assert!(tts(&spec("sarvam", "k")).is_ok());
+        // Pinned model + language options (the vaais Models-page path).
+        let s = spec("sarvam", "k")
+            .with_model("saaras:v2.5")
+            .with_option("language", "hi-IN");
+        assert!(stt(&s).is_ok());
+        let t = spec("sarvam", "k")
+            .with_model("anushka") // TTS spec.model = the voice id
+            .with_option("model", "bulbul:v3")
+            .with_option("language", "hi-IN");
+        assert!(tts(&t).is_ok());
     }
 
     #[test]

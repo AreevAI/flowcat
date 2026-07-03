@@ -7,8 +7,10 @@
 //! calls and, once a segment's worth has accumulated, wraps it in a WAV file and
 //! POSTs it as `multipart/form-data` to `https://api.sarvam.ai/speech-to-text`
 //! with an `api-subscription-key: <api-key>` header and the form fields `model`
-//! (default `saarika:v2.5`) + `language_code`. The JSON response is decoded by
-//! the **pure** [`decode_response`]:
+//! (default `saarika:v2.5`) + `language_code`. The `saaras:*` models (transcribe +
+//! translate) post to `/speech-to-text-translate` instead, without a
+//! `language_code` (that route auto-detects and translates to English). The JSON
+//! response is decoded by the **pure** [`decode_response`]:
 //!
 //! ```json
 //! { "transcript": "नमस्ते", "language_code": "hi-IN" }
@@ -35,6 +37,20 @@ use rest::{multipart_body, Part, SegmentBuffer};
 /// Sarvam's fixed STT endpoint. The **host is fixed**; the API key travels only
 /// in the `api-subscription-key` header, never in the URL.
 pub const SARVAM_STT_URL: &str = "https://api.sarvam.ai/speech-to-text";
+
+/// Sarvam's transcribe-and-translate endpoint — the `saaras:*` models are served
+/// here, not at the plain STT route (same host-is-fixed rule).
+pub const SARVAM_STT_TRANSLATE_URL: &str = "https://api.sarvam.ai/speech-to-text-translate";
+
+/// Endpoint for a model id: `saaras:*` (transcribe + translate) posts to the
+/// translate route; everything else (`saarika:*`) to plain speech-to-text.
+fn endpoint_for(model: &str) -> &'static str {
+    if model.starts_with("saaras") {
+        SARVAM_STT_TRANSLATE_URL
+    } else {
+        SARVAM_STT_URL
+    }
+}
 
 /// Seconds of audio buffered per POSTed segment.
 const SEGMENT_SECS: f32 = 5.0;
@@ -87,15 +103,20 @@ impl SarvamStt {
             return Ok(vec![]);
         };
         let boundary = "----flowcatSarvamBoundary7MA4YWxkTrZu0gW";
-        let parts = vec![
+        let url = endpoint_for(&self.model);
+        let mut parts = vec![
             Part::file("file", "audio.wav", "audio/x-wav", wav),
             Part::text("model", self.model.clone()),
-            Part::text("language_code", self.language.clone()),
         ];
+        // The translate route auto-detects the source language (output is
+        // English); `language_code` is a plain-STT-only field.
+        if url == SARVAM_STT_URL {
+            parts.push(Part::text("language_code", self.language.clone()));
+        }
         let (content_type, body) = multipart_body(boundary, &parts);
         let client = reqwest::Client::new();
         let resp = client
-            .post(SARVAM_STT_URL)
+            .post(url)
             .header("api-subscription-key", &self.api_key)
             .header("Content-Type", content_type)
             .body(body)
@@ -176,6 +197,17 @@ pub(crate) fn decode_response(body: &Value) -> Vec<Frame> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn saaras_models_route_to_the_translate_endpoint() {
+        assert_eq!(endpoint_for("saarika:v2.5"), SARVAM_STT_URL);
+        assert_eq!(endpoint_for("saaras:v2"), SARVAM_STT_TRANSLATE_URL);
+        assert_eq!(
+            endpoint_for(""),
+            SARVAM_STT_URL,
+            "empty model = default saarika"
+        );
+    }
 
     #[test]
     fn decode_transcript_response() {
