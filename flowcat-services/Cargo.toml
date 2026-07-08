@@ -74,6 +74,7 @@ tts-openai      = ["dep:reqwest", "dep:tokio"]                                  
 tts-groq        = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP
 tts-xai         = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP
 tts-speaches    = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP (self-hosted)
+tts-kitten      = ["tts-openai"]                                                        # (W) OpenAI-TTS-HTTP (self-hosted KittenTTS)
 tts-azure       = ["dep:reqwest", "dep:tokio-tungstenite", "dep:tokio"]                 # (D) SSML WS/HTTP
 tts-sarvam      = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
 tts-mistral     = ["dep:reqwest", "dep:tokio"]                                          # (D) HTTP
@@ -148,6 +149,7 @@ stt-all = [
 tts-all = [
     "tts-cartesia", "tts-elevenlabs", "tts-deepgram", "tts-rime", "tts-asyncai",
     "tts-gradium", "tts-soniox", "tts-resemble", "tts-openai", "tts-groq", "tts-xai",
+    "tts-speaches", "tts-kitten",
     "tts-azure", "tts-sarvam", "tts-mistral", "tts-hume", "tts-inworld", "tts-minimax",
     "tts-camb", "tts-speechmatics", "tts-fish", "tts-lmnt", "tts-neuphonic",
     "tts-smallest", "tts-kokoro", "tts-piper", "tts-xtts", "tts-google", "tts-nvidia",

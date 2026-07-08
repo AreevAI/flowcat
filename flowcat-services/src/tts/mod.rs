@@ -67,6 +67,10 @@ pub use xai::XaiTts;
 pub mod speaches;
 #[cfg(feature = "tts-speaches")]
 pub use speaches::SpeachesTts;
+#[cfg(feature = "tts-kitten")]
+pub mod kitten;
+#[cfg(feature = "tts-kitten")]
+pub use kitten::KittenTts;
 
 // --- (D)istinct HTTP cloud TTS (PROVIDERS.md §3) ---
 #[cfg(feature = "tts-azure")]
