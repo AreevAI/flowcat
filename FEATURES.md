@@ -67,7 +67,7 @@ Nothing is on by default. Umbrellas: `stt-all`, `tts-all`, `llm-all`,
 | `stt-aws-transcribe` | (D) | SigV4 WS (`hmac`/`sha2`) |
 | `stt-whisper-local` | (D) | local (`whisper-rs`; **C build, needs `cmake`**) |
 
-### TTS (29)
+### TTS (31)
 
 | Feature | Tag | Transport |
 | --- | --- | --- |
@@ -75,6 +75,7 @@ Nothing is on by default. Umbrellas: `stt-all`, `tts-all`, `llm-all`,
 | `tts-elevenlabs` / `tts-deepgram` / `tts-rime` / `tts-asyncai` / `tts-gradium` / `tts-soniox` / `tts-resemble` | (D) | WS |
 | `tts-openai` | (D) | HTTP base |
 | `tts-groq` / `tts-xai` | (W) over openai | OpenAI-TTS-HTTP |
+| `tts-speaches` / `tts-kitten` | (W) over openai | OpenAI-TTS-HTTP (self-hosted) |
 | `tts-azure` | (D) | SSML WS/HTTP |
 | `tts-sarvam` / `tts-mistral` / `tts-hume` / `tts-inworld` / `tts-minimax` / `tts-camb` / `tts-speechmatics` | (D) | HTTP |
 | `tts-fish` / `tts-lmnt` / `tts-neuphonic` / `tts-smallest` | (D) | interruptible HTTP |

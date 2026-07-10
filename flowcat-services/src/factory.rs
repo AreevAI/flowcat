@@ -361,6 +361,12 @@ pub fn tts(spec: &ProviderSpec) -> Result<Box<dyn TtsService>, FlowcatError> {
             spec.opt("base_url"),
             voice,
         ))),
+        #[cfg(feature = "tts-kitten")]
+        "kitten" => Ok(Box::new(crate::tts::KittenTts::new(
+            key,
+            spec.opt("base_url"),
+            voice,
+        ))),
         other => Err(not_built("tts", other)),
     }
 }
