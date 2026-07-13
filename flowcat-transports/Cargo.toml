@@ -44,7 +44,7 @@ str0m = { version = "0.20", optional = true }
 # is only a pre-release on crates.io; latest stable is 0.2.)
 audiopus = { version = "0.2", optional = true }
 # WebSocket transport.
-tokio-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # Daily REST signaling.
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 # Async runtime for the concrete transports (UDP/WS I/O + tasks). Optional +
