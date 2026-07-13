@@ -39,7 +39,7 @@ tracing = "0.1"
 bytes = "1"
 
 # WebRTC stack (sans-I/O SFU/peer). (Spec §3 said 0.6; latest is 0.20.)
-str0m = { version = "0.20", optional = true }
+str0m = { version = "0.21", optional = true }
 # libopus encode/decode for WebRTC + local audio. (Spec §3 said 0.3, which
 # is only a pre-release on crates.io; latest stable is 0.2.)
 audiopus = { version = "0.2", optional = true }
