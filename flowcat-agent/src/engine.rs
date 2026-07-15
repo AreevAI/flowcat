@@ -628,10 +628,8 @@ fn time_builtin(inner: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Strin
         ("%Y-%m-%d %H:%M %Z", rest)
     } else if let Some(rest) = inner.strip_prefix("current_weekday") {
         ("%A", rest)
-    } else if let Some(rest) = inner.strip_prefix("current_date") {
-        ("%Y-%m-%d", rest)
     } else {
-        return None;
+        ("%Y-%m-%d", inner.strip_prefix("current_date")?)
     };
     if tz_part.is_empty() {
         // UTC.
