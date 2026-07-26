@@ -41,7 +41,7 @@ base64 = "0.22"
 # WS client for the Gemini Live socket. `rustls-tls-webpki-roots` is a
 # self-contained TLS backend (bundled webpki roots, no system OpenSSL) that
 # resolves cleanly for wss:// — verified to compile.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # Sample-rate conversion (8k<->16k carrier<->Gemini-in, 24k->8k Gemini-out).
 rubato = "3"
 # Buffer views for rubato 3.x's `process_into_buffer` (audioadapter), same 3.x
