@@ -144,7 +144,10 @@ impl Resampler {
         let ratio = to_rate as f64 / from_rate as f64;
         let params = SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            // rubato 4.x: `Option<f32>`, where `None` derives a cutoff from
+            // `sinc_len`. Pin the 0.95 the 3.x build used so the filter — and
+            // therefore the resampled audio — is unchanged by the upgrade.
+            f_cutoff: Some(0.95),
             oversampling_factor: 256,
             interpolation: SincInterpolationType::Cubic,
             window: WindowFunction::BlackmanHarris2,
@@ -152,7 +155,7 @@ impl Resampler {
 
         // Fixed input: BLOCK frames in, variable frames out — matches the
         // carrier's fixed input cadence. `max_resample_ratio_relative = 1.0`
-        // because our ratio is constant for the life of the call. (rubato 3.x:
+        // because our ratio is constant for the life of the call. (rubato 4.x:
         // the consolidated `Async` resampler in sinc mode, `FixedAsync::Input`.)
         let inner = Async::<f32>::new_sinc(ratio, 1.0, &params, BLOCK, 1, FixedAsync::Input)
             .map_err(|e| FlowcatError::Codec(format!("rubato init {from_rate}->{to_rate}: {e}")))?;
@@ -204,7 +207,7 @@ impl Resampler {
             self.scratch_in
                 .extend(block.iter().map(|&s| s as f32 / 32768.0));
 
-            // rubato 3.x takes `audioadapter` views; mono PCM is a 1-channel
+            // rubato 4.x takes `audioadapter` views; mono PCM is a 1-channel
             // interleaved buffer, so the flat scratch vecs wrap directly.
             let in_view = InterleavedSlice::new(&self.scratch_in, 1, BLOCK)
                 .map_err(|e| FlowcatError::Codec(format!("rubato input view: {e}")))?;

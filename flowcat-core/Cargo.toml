@@ -44,9 +44,9 @@ base64 = "0.22"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # Sample-rate conversion (8k<->16k carrier<->Gemini-in, 24k->8k Gemini-out).
 rubato = "4"
-# Buffer views for rubato 3.x's `process_into_buffer` (audioadapter), same 3.x
+# Buffer views for rubato 4.x's `process_into_buffer` (audioadapter), same 4.x
 # line rubato pulls. Mono PCM wraps as a 1-channel `InterleavedSlice`.
-audioadapter-buffers = "3"
+audioadapter-buffers = "4"
 # G.711 mu-law / A-law encode+decode (encode_ulaw / decode_ulaw).
 audio-codec-algorithms = "0.8"
 # WAV writing for the call recorder.
