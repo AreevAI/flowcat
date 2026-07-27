@@ -37,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 # WS client for the Gemini Live socket. `rustls-tls-webpki-roots` is a
 # self-contained TLS backend (bundled webpki roots, no system OpenSSL) that
 # resolves cleanly for wss:// — verified to compile.
