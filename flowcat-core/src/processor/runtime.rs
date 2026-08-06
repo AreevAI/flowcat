@@ -142,6 +142,11 @@ pub async fn run_processor(
                 // uninterruptible ones. A kept *downstream terminal* (End/Stop) is
                 // returned rather than blindly forwarded — see below.
                 let kept_terminal = drain_on_interruption(&mut rx, &link).await;
+                // Give the processor its barge-in hook (see
+                // `FrameProcessor::on_interruption`) before the frame moves on.
+                if let Err(e) = p.on_interruption().await {
+                    link.push_error(e.to_string(), false).await;
+                }
                 // Forward the interruption in the direction it arrived.
                 link.push(env.meta, env.frame, env.direction).await;
                 // A downstream End/Stop that was buffered when the interruption hit
