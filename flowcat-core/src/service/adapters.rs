@@ -155,6 +155,12 @@ impl<S: SttService + 'static> FrameProcessor for SttProcessor<S> {
 pub struct LlmProcessor<L: LlmService> {
     /// The wrapped LLM service.
     svc: Arc<Mutex<L>>,
+    /// Optional barge-in generation counter (see
+    /// [`VadProcessor::with_interrupt_flag`](crate::audio::VadProcessor)):
+    /// checked between streamed chunks so an in-flight completion stops pushing
+    /// promptly when the user barges in. The frame-path `Interruption` cannot do
+    /// this — `process_frame` is already running when it arrives.
+    interrupt_flag: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl<L: LlmService> LlmProcessor<L> {
@@ -162,7 +168,14 @@ impl<L: LlmService> LlmProcessor<L> {
     pub fn new(svc: L) -> Self {
         Self {
             svc: Arc::new(Mutex::new(svc)),
+            interrupt_flag: None,
         }
+    }
+
+    /// Cancel an in-flight stream when `flag` is bumped (duplex barge-in).
+    pub fn with_interrupt_flag(mut self, flag: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.interrupt_flag = Some(flag);
+        self
     }
 
     /// Run the LLM over `ctx`, pushing each streamed frame downstream in order.
@@ -173,9 +186,23 @@ impl<L: LlmService> LlmProcessor<L> {
         // guard outlives the stream. Push each frame as it arrives (true streaming);
         // `link.push_down` doesn't touch the guard, so the borrow is fine.
         let mut pushed = 0usize;
+        let start_gen = self
+            .interrupt_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+        let mut cancelled = false;
         let err = match guard.run_llm(ctx).await {
             Ok(mut stream) => {
                 while let Some(f) = stream.next().await {
+                    // Cooperative barge-in cancel: stop consuming (and pushing)
+                    // as soon as the barge-in generation moves. Dropping the
+                    // stream aborts the underlying request.
+                    if let (Some(flag), Some(g0)) = (&self.interrupt_flag, start_gen) {
+                        if flag.load(std::sync::atomic::Ordering::SeqCst) != g0 {
+                            cancelled = true;
+                            break;
+                        }
+                    }
                     pushed += 1;
                     link.push_down(f).await;
                 }
@@ -183,6 +210,12 @@ impl<L: LlmService> LlmProcessor<L> {
             }
             Err(e) => Some(format!("llm: {e}")),
         };
+        if cancelled {
+            tracing::info!(pushed, "cascaded LLM stream cancelled by barge-in");
+            // Close the response framing so downstream aggregators can't wedge
+            // in an open in_response span.
+            link.push_down(Frame::LlmResponseEnd).await;
+        }
         drop(guard);
         match &err {
             Some(msg) => tracing::warn!(error = %msg, "cascaded LLM error"),

@@ -327,6 +327,16 @@ pub trait FrameProcessor: Send + 'static {
 
     /// Called on `End`/`Stop`/`Cancel` after the terminal frame is forwarded.
     /// Flush + close. Default: no-op.
+    /// Called by the runtime when a [`Frame::Interruption`] is handled for this
+    /// processor (after its queued interruptible frames were drained, before the
+    /// interruption is forwarded). Default: no-op. Override to react to barge-in
+    /// (flush playback, repair context, cancel in-flight work). This exists
+    /// because `Interruption` is intercepted by the runtime and never reaches
+    /// [`process_frame`](FrameProcessor::process_frame).
+    async fn on_interruption(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     async fn stop(&mut self, _reason: StopReason) -> Result<()> {
         Ok(())
     }
