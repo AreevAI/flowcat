@@ -338,6 +338,18 @@ pub struct VadProcessor<V: VadAnalyzer> {
     bot_speaking: bool,
     /// If true, emit `Interruption` on a rising edge while the bot speaks.
     interrupt_on_barge_in: bool,
+    /// Optional barge-in generation counter, bumped synchronously at detection
+    /// time (before the `Interruption` broadcast). Busy processors (an LLM
+    /// adapter mid-stream) poll it between chunks for cooperative cancellation —
+    /// the frame path cannot preempt an in-flight `process_frame`.
+    interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Optional out-of-band waker fired at barge-in detection. The frame-path
+    /// `Interruption` can stall behind any hop that is mid-`await` (observed
+    /// live: 14 ms vs 2.1 s sink delivery depending on TTS activity); a
+    /// dedicated reactor task woken here can flush playback immediately.
+    /// Signalled with `notify_one`, so a barge-in raised while the reactor is
+    /// still handling the previous one is stored rather than lost.
+    interrupt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl<V: VadAnalyzer> VadProcessor<V> {
@@ -353,7 +365,24 @@ impl<V: VadAnalyzer> VadProcessor<V> {
             last_state: VadState::Quiet,
             bot_speaking: false,
             interrupt_on_barge_in: true,
+            interrupt_flag: None,
+            interrupt_notify: None,
         }
+    }
+
+    /// Fire `notify` (out-of-band) on each barge-in detection.
+    pub fn with_interrupt_notify(mut self, notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        self.interrupt_notify = Some(notify);
+        self
+    }
+
+    /// Bump `flag` on each barge-in detection (see the field docs).
+    pub fn with_interrupt_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.interrupt_flag = Some(flag);
+        self
     }
 
     /// Disable broadcasting `Interruption` on barge-in (the turn controller may own
@@ -380,6 +409,13 @@ impl<V: VadAnalyzer> VadProcessor<V> {
                     .await;
                 link.push_down(Frame::UserStartedSpeaking).await;
                 if self.bot_speaking && self.interrupt_on_barge_in {
+                    tracing::debug!("barge-in: user speech while bot speaking");
+                    if let Some(flag) = &self.interrupt_flag {
+                        flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if let Some(n) = &self.interrupt_notify {
+                        n.notify_one();
+                    }
                     link.broadcast(Frame::Interruption).await;
                 }
             }

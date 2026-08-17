@@ -124,6 +124,21 @@ impl<S: SttService + 'static> FrameProcessor for SttProcessor<S> {
                     Err(e) => link.push_error(format!("stt: {e}"), false).await,
                 }
             }
+            // End of a VAD-delimited utterance: give a batch service the chance to
+            // transcribe its buffered tail now instead of waiting for its next
+            // fixed window (which would split the turn). No-op for a streaming
+            // service — `SttService::flush` defaults to returning nothing.
+            Frame::UserStoppedSpeaking => {
+                match self.svc.lock().await.flush().await {
+                    Ok(frames) => {
+                        for f in frames {
+                            link.push_down(f).await;
+                        }
+                    }
+                    Err(e) => link.push_error(format!("stt flush: {e}"), false).await,
+                }
+                link.push(env.meta, env.frame, env.direction).await;
+            }
             // STT mute control (pipecat `STTMuteFrame`). Forward so a downstream
             // observer/UI still sees it.
             Frame::SttMute(muted) => {
@@ -155,6 +170,12 @@ impl<S: SttService + 'static> FrameProcessor for SttProcessor<S> {
 pub struct LlmProcessor<L: LlmService> {
     /// The wrapped LLM service.
     svc: Arc<Mutex<L>>,
+    /// Optional barge-in generation counter (see
+    /// [`VadProcessor::with_interrupt_flag`](crate::audio::VadProcessor)):
+    /// checked between streamed chunks so an in-flight completion stops pushing
+    /// promptly when the user barges in. The frame-path `Interruption` cannot do
+    /// this — `process_frame` is already running when it arrives.
+    interrupt_flag: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl<L: LlmService> LlmProcessor<L> {
@@ -162,7 +183,14 @@ impl<L: LlmService> LlmProcessor<L> {
     pub fn new(svc: L) -> Self {
         Self {
             svc: Arc::new(Mutex::new(svc)),
+            interrupt_flag: None,
         }
+    }
+
+    /// Cancel an in-flight stream when `flag` is bumped (duplex barge-in).
+    pub fn with_interrupt_flag(mut self, flag: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.interrupt_flag = Some(flag);
+        self
     }
 
     /// Run the LLM over `ctx`, pushing each streamed frame downstream in order.
@@ -173,9 +201,23 @@ impl<L: LlmService> LlmProcessor<L> {
         // guard outlives the stream. Push each frame as it arrives (true streaming);
         // `link.push_down` doesn't touch the guard, so the borrow is fine.
         let mut pushed = 0usize;
+        let start_gen = self
+            .interrupt_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+        let mut cancelled = false;
         let err = match guard.run_llm(ctx).await {
             Ok(mut stream) => {
                 while let Some(f) = stream.next().await {
+                    // Cooperative barge-in cancel: stop consuming (and pushing)
+                    // as soon as the barge-in generation moves. Dropping the
+                    // stream aborts the underlying request.
+                    if let (Some(flag), Some(g0)) = (&self.interrupt_flag, start_gen) {
+                        if flag.load(std::sync::atomic::Ordering::SeqCst) != g0 {
+                            cancelled = true;
+                            break;
+                        }
+                    }
                     pushed += 1;
                     link.push_down(f).await;
                 }
@@ -183,6 +225,12 @@ impl<L: LlmService> LlmProcessor<L> {
             }
             Err(e) => Some(format!("llm: {e}")),
         };
+        if cancelled {
+            tracing::debug!(pushed, "cascaded LLM stream cancelled by barge-in");
+            // Close the response framing so downstream aggregators can't wedge
+            // in an open in_response span.
+            link.push_down(Frame::LlmResponseEnd).await;
+        }
         drop(guard);
         match &err {
             Some(msg) => tracing::warn!(error = %msg, "cascaded LLM error"),
@@ -330,5 +378,243 @@ impl<T: TtsService + 'static> FrameProcessor for TtsProcessor<T> {
             _ => link.push(env.meta, env.frame, env.direction).await,
         }
         Ok(())
+    }
+}
+
+// ===========================================================================
+// Tests — the barge-in seams the adapters own (offline, no provider).
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observer::{FrameEvent, FrameObserver};
+    use crate::pipeline::{Pipeline, PipelineTask, PipelineTaskParams};
+    use crate::processor::frame::AudioFrame;
+    use crate::service::Tool;
+    use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// Records every frame name the pipeline processed, plus the `LlmText` payloads.
+    #[derive(Default)]
+    struct Tap {
+        names: StdMutex<Vec<&'static str>>,
+        llm_text: StdMutex<Vec<String>>,
+        transcripts: StdMutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl FrameObserver for Tap {
+        async fn on_process(&self, e: &FrameEvent<'_>) {
+            self.names.lock().unwrap().push(e.frame.name());
+            match &e.frame {
+                // One entry per *distinct* emitted frame — `on_process` fires once
+                // per processor that sees it, so dedupe on the internal Sink hop.
+                Frame::LlmText(t) if e.processor == "Sink" => {
+                    self.llm_text.lock().unwrap().push(t.clone())
+                }
+                Frame::Transcription { text, .. } if e.processor == "Sink" => {
+                    self.transcripts.lock().unwrap().push(text.clone())
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---- STT flush seam ---------------------------------------------------
+
+    /// A batch-style STT: buffers audio and only transcribes on `flush()` — the
+    /// shape `whisper_local` has, and the reason the seam exists.
+    struct BufferingStt {
+        buffered: usize,
+    }
+    #[async_trait]
+    impl SttService for BufferingStt {
+        fn name(&self) -> &str {
+            "BufferingStt"
+        }
+        async fn start(&mut self, _p: &StartParams) -> Result<()> {
+            Ok(())
+        }
+        async fn run_stt(&mut self, audio: Arc<AudioFrame>) -> Result<Vec<Frame>> {
+            self.buffered += audio.pcm.len();
+            Ok(vec![])
+        }
+        async fn flush(&mut self) -> Result<Vec<Frame>> {
+            if self.buffered == 0 {
+                return Ok(vec![]);
+            }
+            let n = std::mem::take(&mut self.buffered);
+            Ok(vec![Frame::Transcription {
+                text: format!("{n} samples"),
+                user_id: Arc::from("user"),
+                language: None,
+                final_: true,
+            }])
+        }
+        async fn set_muted(&mut self, _muted: bool) {}
+    }
+
+    /// `UserStoppedSpeaking` (a VAD falling edge) must reach the service as a
+    /// `flush()` — otherwise a batch STT's last window sits in its buffer until the
+    /// *next* turn's audio arrives, and two utterances merge into one late
+    /// transcript. (The edge is a System frame and the transcription a Control one,
+    /// so their *arrival* order downstream is set by the channel split, not here;
+    /// what this pins is that the flush happens and its text is emitted.)
+    #[tokio::test]
+    async fn user_stopped_speaking_flushes_a_batch_stt_before_forwarding_the_edge() {
+        let tap = Arc::new(Tap::default());
+        let pipeline = Pipeline::new(vec![Box::new(SttProcessor::new(BufferingStt {
+            buffered: 0,
+        }))]);
+        let task = PipelineTask::new(
+            pipeline,
+            PipelineTaskParams::default(),
+            vec![tap.clone() as Arc<dyn FrameObserver>],
+        );
+
+        task.queue_frame(Frame::InputAudio(Arc::new(AudioFrame::mono(
+            vec![1i16; 40],
+            16_000,
+        ))))
+        .await;
+        task.queue_frame(Frame::UserStoppedSpeaking).await;
+        task.stop_when_done().await;
+        tokio::time::timeout(Duration::from_secs(5), task.run())
+            .await
+            .expect("stt flush pipeline timed out")
+            .expect("run ok");
+
+        assert_eq!(
+            tap.transcripts.lock().unwrap().clone(),
+            vec!["40 samples".to_string()],
+            "the buffered tail must be transcribed at the falling edge"
+        );
+        let names = tap.names.lock().unwrap().clone();
+        assert!(
+            names.contains(&"UserStoppedSpeaking"),
+            "the edge must still be forwarded after the flush; saw {names:?}"
+        );
+    }
+
+    /// The default `flush()` is a no-op, so a streaming service (which does its own
+    /// endpointing) is unaffected by the new seam.
+    #[tokio::test]
+    async fn default_flush_is_a_no_op_for_a_streaming_service() {
+        struct Streaming;
+        #[async_trait]
+        impl SttService for Streaming {
+            fn name(&self) -> &str {
+                "Streaming"
+            }
+            async fn start(&mut self, _p: &StartParams) -> Result<()> {
+                Ok(())
+            }
+            async fn run_stt(&mut self, _a: Arc<AudioFrame>) -> Result<Vec<Frame>> {
+                Ok(vec![])
+            }
+            async fn set_muted(&mut self, _muted: bool) {}
+        }
+        assert!(Streaming.flush().await.expect("flush ok").is_empty());
+    }
+
+    // ---- LLM cooperative barge-in cancel -----------------------------------
+
+    /// An LLM whose stream raises the shared barge-in flag partway through, i.e.
+    /// the user barges in while the completion is still streaming.
+    struct BargeInMidStream {
+        flag: Arc<AtomicU64>,
+        chunks: usize,
+        /// Zero-based index of the chunk at which the barge-in fires.
+        at: usize,
+    }
+    #[async_trait]
+    impl LlmService for BargeInMidStream {
+        fn name(&self) -> &str {
+            "BargeInMidStream"
+        }
+        async fn start(&mut self, _p: &StartParams) -> Result<()> {
+            Ok(())
+        }
+        async fn run_llm<'a>(&'a mut self, _ctx: &'a LlmContext) -> Result<BoxStream<'a, Frame>> {
+            let flag = self.flag.clone();
+            let (chunks, at) = (self.chunks, self.at);
+            Ok(Box::pin(futures::stream::unfold(0usize, move |i| {
+                let flag = flag.clone();
+                async move {
+                    if i >= chunks {
+                        return None;
+                    }
+                    if i == at {
+                        flag.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some((Frame::LlmText(format!("t{i}")), i + 1))
+                }
+            })))
+        }
+        fn set_tools(&mut self, _tools: Vec<Tool>) {}
+    }
+
+    async fn run_llm_turn(llm: LlmProcessor<BargeInMidStream>) -> Arc<Tap> {
+        let tap = Arc::new(Tap::default());
+        let task = PipelineTask::new(
+            Pipeline::new(vec![Box::new(llm)]),
+            PipelineTaskParams::default(),
+            vec![tap.clone() as Arc<dyn FrameObserver>],
+        );
+        task.queue_frame(Frame::LlmContext(Arc::new(LlmContext {
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            tools: vec![],
+        })))
+        .await;
+        task.stop_when_done().await;
+        tokio::time::timeout(Duration::from_secs(5), task.run())
+            .await
+            .expect("llm pipeline timed out")
+            .expect("run ok");
+        tap
+    }
+
+    /// With the flag wired, a barge-in mid-stream stops the adapter pushing further
+    /// tokens and closes the response framing. Without the cancel the whole reply
+    /// would still be assembled and spoken *after* the user interrupted — the frame
+    /// path can't preempt a `process_frame` that is already inside the stream.
+    #[tokio::test]
+    async fn barge_in_flag_cancels_an_in_flight_llm_stream() {
+        let flag = Arc::new(AtomicU64::new(0));
+        let tap = run_llm_turn(
+            LlmProcessor::new(BargeInMidStream {
+                flag: flag.clone(),
+                chunks: 6,
+                at: 2,
+            })
+            .with_interrupt_flag(flag),
+        )
+        .await;
+
+        assert_eq!(
+            tap.llm_text.lock().unwrap().clone(),
+            vec!["t0".to_string(), "t1".to_string()],
+            "tokens from the barge-in chunk onward must not be pushed"
+        );
+        assert!(
+            tap.names.lock().unwrap().contains(&"LlmResponseEnd"),
+            "a cancelled stream must still close its response framing"
+        );
+    }
+
+    /// Same LLM, no flag wired (the default / half-duplex path): every token is
+    /// pushed. Guards against the cancel changing stock behaviour.
+    #[tokio::test]
+    async fn without_the_flag_the_whole_stream_is_pushed() {
+        // Same barge-in mid-stream, but no `with_interrupt_flag` — the adapter has
+        // nothing to poll, so it streams to completion exactly as it does today.
+        let tap = run_llm_turn(LlmProcessor::new(BargeInMidStream {
+            flag: Arc::new(AtomicU64::new(0)),
+            chunks: 4,
+            at: 1,
+        }))
+        .await;
+        assert_eq!(tap.llm_text.lock().unwrap().len(), 4);
     }
 }
