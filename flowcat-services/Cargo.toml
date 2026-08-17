@@ -196,7 +196,8 @@ tokio-tungstenite = { version = "0.30", optional = true, default-features = fals
 tokio = { version = "1", optional = true, features = ["rt", "sync", "macros", "net", "time"] }
 # base64 — decode/encode streamed audio chunks (Cartesia/ElevenLabs/OpenAI-Realtime/
 # Nova Sonic). Same crate flowcat-core uses for the Gemini inline-data codec.
-base64 = { version = "0.23", optional = true }
+# See flowcat-core: pin off `simd-unsafe`, we use the scalar engine only.
+base64 = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 # gRPC providers (Google STT/TTS). (Spec §3 said 0.12; latest is 0.14 — pinned to
 # the available major.)
 tonic = { version = "0.14", optional = true }
