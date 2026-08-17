@@ -330,7 +330,7 @@ impl Link {
 
 /// The building block. Each processor runs in **its own tokio task** fed by a
 /// bounded mpsc channel (§2.2). The framework owns the task loop; an impl only
-/// writes `process_frame` (and optional `start`/`stop` hooks).
+/// writes `process_frame` (and optional `start`/`on_interruption`/`stop` hooks).
 ///
 /// Mirrors pipecat `FrameProcessor` (frame_processor.py:175): `process_frame`,
 /// prev/next links, system-frame priority, interruption handling — but the per-
@@ -353,6 +353,11 @@ pub trait FrameProcessor: Send + 'static {
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         link.push(env.meta, env.frame, env.direction).await; Ok(())
     }
+
+    /// Called on `Interruption` after the interruptible backlog is drained and
+    /// before the frame is forwarded — the delivery path for barge-in reactions
+    /// (§2.5). Default: no-op. **Must not block.**
+    async fn on_interruption(&mut self) -> Result<()> { Ok(()) }
 
     /// Called on `End`/`Stop`/`Cancel` after the terminal frame is forwarded.
     /// Flush + close. Default: no-op.
@@ -390,7 +395,8 @@ async fn run_processor(mut p: Box<dyn FrameProcessor>, mut rx: ProcessorRx, link
         if let Some(o) = &setup.observer { o.on_process(&link.name, &env, setup.clock.now_ns()); }
         match &env.frame {
             Frame::Start(p0)   => { p.start(&setup, p0).await.ok(); link.push(env.meta, env.frame, env.direction).await; }
-            Frame::Interruption => { /* §2.5: drain `normal` of interruptible frames, keep uninterruptible; forward */ }
+            Frame::Interruption => { /* §2.5: drain `normal` of interruptible frames, keep uninterruptible;
+                                        then p.on_interruption().await; then forward */ }
             Frame::Cancel{..} | Frame::End{..} | Frame::Stop
                                => { let _ = p.stop(reason(&env.frame)).await; link.push(env.meta, env.frame, env.direction).await; if terminal { break } }
             _                  => { if let Err(e) = p.process_frame(env, &link).await { link.push_error(e.to_string(), false).await; } }
@@ -485,10 +491,26 @@ shared I/O cost, not framework cost.
 Barge-in (`Frame::Interruption`) is produced by the turn/VAD start strategy or any
 processor via `link.broadcast(Frame::Interruption)`. It travels the **system** channel
 both directions; each processor drains its normal queue of interruptible frames and
-cancels in-flight interruptible work, then forwards. The transport-output processor
-additionally clears the carrier's playback buffer (today's `transport.send_clear()`,
-pipeline.rs:370 → a `process_frame` arm on `TransportOutput`). This is the literal port
-of pipecat `broadcast_interruption` (frame_processor.py:704).
+cancels in-flight interruptible work, then forwards. This is the literal port of
+pipecat `broadcast_interruption` (frame_processor.py:704).
+
+`Interruption` is a **lifecycle frame**: like `Start`/`End` it is intercepted by the
+task loop and never reaches `process_frame`. A processor reacts to barge-in by
+overriding **`on_interruption`** — the transport-output sinks clear the carrier's
+playback buffer there (`transport.send_clear()`), the text aggregators/filters reset
+their buffers, and the assistant context aggregator keeps the partially-spoken reply
+and drops the open response span. Writing a `Frame::Interruption` arm in
+`process_frame` instead is silently dead code.
+
+**What the frame path cannot do.** The interruption jumps queues, but it cannot
+preempt a `process_frame` that is already inside an `.await` (a TTS synthesis, an LLM
+stream): the hop only sees it when that call returns. Anything needing sub-frame
+latency — cancelling an in-flight completion, flushing the carrier *now* — needs an
+out-of-band signal (a shared atomic polled between streamed chunks, a `Notify`-woken
+reactor task) raised at detection time, alongside the broadcast. `VadProcessor`'s
+`with_interrupt_flag`/`with_interrupt_notify` are those seams, and
+`build_cascaded_call_duplex` wires them; both are opt-in, and the frame path remains
+the correctness path.
 
 ---
 
@@ -721,7 +743,7 @@ Today's five trait seams (`MediaTransport`, `RealtimeLlm`, `AgentBrain`, `Sessio
 | Today (seam / inline logic) | becomes | crate | notes |
 |---|---|---|---|
 | `MediaTransport::recv` (media.rs:49) | **`TransportInput` processor** — a *source*: reads the transport, emits `Frame::InputAudio`/`UserStartedSpeaking`/lifecycle downstream | `flowcat-transports` (trait stays in core) | pipecat `BaseInputTransport` |
-| `MediaTransport::send_audio`/`send_clear` (media.rs:53/57) | **`TransportOutput` processor** — a *sink*: consumes `OutputAudio`/`TtsAudio`, plays to carrier; on `Interruption` clears playback (was pipeline.rs:370) | `flowcat-transports` | pipecat `BaseOutputTransport`; emits `BotStarted/StoppedSpeaking` |
+| `MediaTransport::send_audio`/`send_clear` (media.rs:53/57) | **`TransportOutput` processor** — a *sink*: consumes `OutputAudio`/`TtsAudio`, plays to carrier; clears playback from `on_interruption` (was pipeline.rs:370) | `flowcat-transports` | pipecat `BaseOutputTransport`; emits `BotStarted/StoppedSpeaking` |
 | `RealtimeLlm` (realtime/mod.rs:22) | **`RealtimeLlmService` processor** — consumes `InputAudio`, emits `TtsAudio`(bot)/`Transcription`/`FunctionCallsStarted`/`Interruption`/`Metrics`; the reader-task→mpsc bridge (gemini_live.rs:265) becomes the processor's internal task feeding `link` | `flowcat-services` (`realtime-gemini` feature) | the trait below; Gemini is one impl |
 | `AgentBrain` (brain.rs:22) | **`BrainProcessor`** — consumes `FunctionCallsStarted`/tool-call frames, emits `UpdateSettings`(new prompt+tools) on transition / `End` on terminal; holds the graph state | the embedder (its glue) | pipecat has no peer; this is the embedder's engine adapter |
 | `SessionSource` (session.rs:21) | **stays embedder glue, NOT a processor** — a service the `BrainProcessor` + a `FinalizeProcessor` *call*; bootstrap/finalize/artifact-upload is control-plane I/O, not a media frame stage | the embedder | see §6.2 — it leaves flowcat-core for OSS cleanliness |

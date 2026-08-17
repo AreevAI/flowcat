@@ -294,10 +294,12 @@ impl Link {
 /// - [`Frame::Start`] → calls [`start`](FrameProcessor::start), then forwards.
 /// - A **downstream** [`Frame::End`]/[`Frame::Stop`]/[`Frame::Cancel`] → calls
 ///   [`stop`](FrameProcessor::stop), forwards, and (End/Cancel) ends the task.
-/// - [`Frame::Interruption`] → drains the interruptible backlog, then forwards.
+/// - [`Frame::Interruption`] → drains the interruptible backlog, calls
+///   [`on_interruption`](FrameProcessor::on_interruption), then forwards.
 ///
 /// So **your `process_frame` never sees these frames** — observe lifecycle via the
-/// `start`/`stop` hooks (this is why the internal `Sink` taps from the hooks). An
+/// `start`/`on_interruption`/`stop` hooks (this is why the internal `Sink` taps
+/// from the hooks). An
 /// *upstream* End/Stop/Cancel is the exception: it is a "request to end" and DOES
 /// reach `process_frame` (the default forwards it upstream so the `Source` can
 /// convert it to a downstream drain — pipecat's `EndTaskFrame` vs `EndFrame`). Keep
@@ -322,6 +324,22 @@ pub trait FrameProcessor: Send + 'static {
     /// default.
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         link.push(env.meta, env.frame, env.direction).await;
+        Ok(())
+    }
+
+    /// Called on [`Frame::Interruption`] (barge-in), after this processor's queued
+    /// interruptible frames were drained and before the interruption is forwarded.
+    /// Default: no-op. Override to react — flush carrier playback, reset a text
+    /// aggregator, repair context.
+    ///
+    /// This hook exists because `Interruption` is a lifecycle frame the runtime
+    /// intercepts: like `Start`/`End`, it never reaches
+    /// [`process_frame`](FrameProcessor::process_frame), so a `Frame::Interruption`
+    /// arm there is silently dead code.
+    ///
+    /// **Must not block** — same contract as `process_frame`. Interruption is the
+    /// latency-critical path; anything slow here delays the audible stop.
+    async fn on_interruption(&mut self) -> Result<()> {
         Ok(())
     }
 

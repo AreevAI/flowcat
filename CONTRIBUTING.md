@@ -119,7 +119,8 @@ client + fixtures.
 
 Each processor is a `FrameProcessor` (`flowcat-core/src/processor/`). The
 framework owns the per-processor tokio task, the bounded/priority channels, and
-the lifecycle; you write `process_frame` and optionally `start`/`stop`.
+the lifecycle; you write `process_frame` and optionally
+`start`/`on_interruption`/`stop`.
 
 **The one contract that surprises people — lifecycle/system frames bypass
 `process_frame`** ([`PROCESSOR-DESIGN.md`](PROCESSOR-DESIGN.md) §2.1–§2.3):
@@ -129,14 +130,21 @@ the lifecycle; you write `process_frame` and optionally `start`/`stop`.
   does **not** reach `process_frame`.
 - `End` / `Stop` / `Cancel` → the framework calls your `async fn stop(&mut self,
   reason)` (flush + close), then forwards. Also **not** via `process_frame`.
-- `Interruption` and other **System** frames ride an unbounded priority channel
-  and are drained ahead of data/control by a `biased` select; the task loop
-  handles interruption (draining interruptible queued frames, keeping
-  uninterruptible ones, cancelling an in-flight interruptible `process_frame`).
+- `Interruption` (barge-in) → the task loop drains the queued interruptible
+  frames (keeping uninterruptible ones), calls your `async fn
+  on_interruption(&mut self)`, then forwards. Also **not** via `process_frame` —
+  a `Frame::Interruption` arm there is silently dead code. Note what this hook
+  does *not* buy you: an interruption cannot preempt a `process_frame` that is
+  already inside an `.await`, so anything needing sub-frame latency (cancelling
+  an in-flight LLM stream) has to poll an out-of-band flag — see
+  [`PROCESSOR-DESIGN.md`](PROCESSOR-DESIGN.md) §2.5.
+- Other **System** frames ride an unbounded priority channel and are drained
+  ahead of data/control by a `biased` select.
 
-So **`process_frame` only ever sees Data/Control frames.** Do not put socket
-open/close in `process_frame` — it will never run for the lifecycle frames that
-should trigger it. Other rules:
+So **`process_frame` only ever sees Data/Control frames** (plus non-lifecycle
+System frames such as `InputAudio`). Do not put socket open/close in
+`process_frame` — it will never run for the lifecycle frames that should trigger
+it. Other rules:
 
 - **`process_frame` must not block.** Long work (a provider round-trip) is driven
   by an internally-spawned task that feeds results back as frames — the Gemini

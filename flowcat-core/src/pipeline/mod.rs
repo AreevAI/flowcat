@@ -42,9 +42,9 @@ use crate::processor::{
 };
 
 pub use cascaded::{
-    build_cascaded_call_with_observers, build_cascaded_pipeline, build_cascaded_task,
-    build_cascaded_task_with_observers, CascadedConfig, CascadedTask, ContextSummarizer,
-    SummarizerConfig,
+    build_cascaded_call_duplex, build_cascaded_call_with_observers, build_cascaded_pipeline,
+    build_cascaded_task, build_cascaded_task_with_observers, CascadedConfig, CascadedTask,
+    ContextSummarizer, SummarizerConfig,
 };
 pub use context_relay::{
     ContextCompactor, ContextDigest, ContextRelayConfig, ContextRelayProcessor, LlmCompactor,
