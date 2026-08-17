@@ -1056,6 +1056,18 @@ impl<T: MediaTransport + 'static> FrameProcessor for TransportOutput<T> {
         Ok(())
     }
 
+    /// Barge-in (call.rs's `RealtimeEvent::Interrupted` arm): flush the carrier's
+    /// queued bot audio. The model stops generating service-side, but whatever we
+    /// already handed the carrier keeps playing until it is cleared.
+    async fn on_interruption(&mut self) -> Result<()> {
+        if let Err(e) = self.transport.send_clear().await {
+            self.state.lock().unwrap().record_error(e);
+        }
+        // The carrier dropped its queued bot audio — nothing left to drain.
+        self.bot_audio_until = None;
+        Ok(())
+    }
+
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         match &env.frame {
             // Bot audio out (call.rs's RealtimeEvent::AudioOut arm): record at 24k,
@@ -1091,16 +1103,6 @@ impl<T: MediaTransport + 'static> FrameProcessor for TransportOutput<T> {
                         self.state.lock().unwrap().record_error(e);
                     }
                 }
-            }
-            // Barge-in (call.rs's RealtimeEvent::Interrupted arm): flush the carrier.
-            Frame::Interruption => {
-                if let Err(e) = self.transport.send_clear().await {
-                    self.state.lock().unwrap().record_error(e);
-                }
-                // The carrier dropped its queued bot audio — nothing left to drain.
-                self.bot_audio_until = None;
-                // Forward the interruption in its direction (framework also drains).
-                link.push(env.meta, env.frame, env.direction).await;
             }
             // End-of-call: let the final bot utterance finish playing before the
             // carrier WS closes. The model emits the goodbye audio AND `endCall` in
@@ -1851,6 +1853,73 @@ mod tests {
                 (true, "I'd like to end now".to_string()),
             ],
             "expected two growing interim lines then one final, got {seen:?}"
+        );
+    }
+
+    /// A carrier that records how many times playback was flushed.
+    struct ClearSpy {
+        clears: Arc<std::sync::atomic::AtomicUsize>,
+        rate: u32,
+    }
+    #[async_trait::async_trait]
+    impl MediaTransport for ClearSpy {
+        async fn recv(&mut self) -> Option<MediaIn> {
+            None
+        }
+        async fn send_audio(&mut self, _c: AudioChunk) -> std::result::Result<(), FlowcatError> {
+            Ok(())
+        }
+        async fn send_clear(&mut self) -> std::result::Result<(), FlowcatError> {
+            self.clears
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn carrier_rate(&self) -> u32 {
+            self.rate
+        }
+    }
+
+    /// Regression: barge-in must flush the carrier's queued bot audio.
+    ///
+    /// `Frame::Interruption` is a lifecycle frame the runtime intercepts — it never
+    /// reaches `process_frame`, so the sink's flush has to hang off the
+    /// `on_interruption` hook. As a `process_frame` arm it was unreachable, and the
+    /// already-queued reply kept playing over the interrupting caller even though
+    /// the model had stopped generating service-side.
+    #[tokio::test]
+    async fn barge_in_flushes_the_carrier_playback_at_the_sink() {
+        let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state: SharedState = Arc::new(Mutex::new(LiveState::new(CARRIER_RATE)));
+        let sink = TransportOutput::new(
+            ClearSpy {
+                clears: clears.clone(),
+                rate: CARRIER_RATE,
+            },
+            CARRIER_RATE,
+            state,
+        );
+
+        let task = PipelineTask::new(
+            Pipeline::new(vec![Box::new(sink)]),
+            PipelineTaskParams::default(),
+            vec![],
+        );
+        task.queue_frame(Frame::OutputAudio(Arc::new(AudioFrame::mono(
+            vec![1i16; 480],
+            GEMINI_OUTPUT_RATE,
+        ))))
+        .await;
+        task.queue_frame(Frame::Interruption).await;
+        task.stop_when_done().await;
+        tokio::time::timeout(Duration::from_secs(5), task.run())
+            .await
+            .expect("sink pipeline timed out")
+            .expect("run ok");
+
+        assert_eq!(
+            clears.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the interruption must reach the sink and flush the carrier exactly once"
         );
     }
 

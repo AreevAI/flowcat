@@ -361,21 +361,83 @@ impl BotSpeakingNotifier {
 }
 
 // ===========================================================================
+// StaleAudioLatch — drops the interrupted reply's in-flight TTS audio.
+// ===========================================================================
+
+/// Guards the window between the out-of-band reactor flushing the carrier and
+/// the frame-path `Interruption` reaching the sink. TTS audio synthesized for
+/// the interrupted reply can still land inside it, and must be dropped rather
+/// than played over the caller who just barged in.
+///
+/// Both ends stamp the **barge-in generation** they observed (the counter the
+/// VAD bumps at detection) instead of flipping a flag: the two tasks are woken
+/// independently and either can be scheduled first, and a bool armed by the
+/// reactor *after* the sink already cleared it would suppress bot audio for the
+/// rest of the call. Stamping makes the latch order-independent — it is only
+/// stale while a generation was armed that the sink has not yet acknowledged.
+struct StaleAudioLatch {
+    /// Shared with [`VadProcessor::with_interrupt_flag`]; bumped at detection.
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    armed: std::sync::atomic::AtomicU64,
+    cleared: std::sync::atomic::AtomicU64,
+}
+
+impl StaleAudioLatch {
+    fn new(generation: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            generation,
+            armed: std::sync::atomic::AtomicU64::new(0),
+            cleared: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The reactor flushed the carrier for this barge-in — drop what follows
+    /// until the sink acknowledges it. `fetch_max`, so a late arm from a
+    /// superseded barge-in can never walk the latch backwards.
+    fn arm(&self) {
+        self.armed
+            .fetch_max(self.current(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The frame-path `Interruption` reached the sink: everything arriving from
+    /// now on belongs to the *next* reply.
+    fn clear(&self) {
+        self.cleared
+            .fetch_max(self.current(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_stale(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            > self.cleared.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+// ===========================================================================
 // SpeechGate — VAD-edged speech segmentation for duplex STT.
 // ===========================================================================
 
-/// Number of samples in the all-zero **flush marker** chunk the gate emits at a
-/// VAD falling edge. A deliberately odd length so a batch STT service can
-/// distinguish it from real (gated-out) audio and finalize the utterance.
-pub const SPEECH_GATE_FLUSH_SAMPLES: usize = 333;
+/// Pre-roll retained ahead of a VAD rising edge, so the first phoneme of the
+/// utterance isn't clipped by the detector's own attack time.
+const SPEECH_GATE_PREROLL_MS: usize = 300;
 
 /// Sits between the VAD and STT in the duplex chain. Fixed-window batch STT
-/// (whisper.cpp) has no endpointing: fed raw duplex audio it transcribes
-/// silence (hallucinated turns) and splits utterances at arbitrary window
-/// boundaries. The gate forwards `InputAudio` only from a VAD rising edge
-/// (plus ~300 ms of pre-roll so the first phoneme isn't clipped) to the
-/// falling edge, then emits the flush marker so the STT can finalize exactly
-/// one utterance per VAD-detected turn.
+/// (whisper.cpp) has no endpointing: fed raw duplex audio it transcribes silence
+/// (hallucinated turns) and splits utterances at arbitrary window boundaries.
+/// The gate forwards `InputAudio` only between a VAD rising edge (plus
+/// [`SPEECH_GATE_PREROLL_MS`] of pre-roll) and the falling edge; the
+/// `UserStoppedSpeaking` it forwards is what makes [`SttProcessor`] call
+/// [`SttService::flush`](crate::service::SttService::flush), so the STT finalizes
+/// exactly one utterance per VAD-detected turn.
+///
+/// Recording caveat: the gate is upstream of the [`RecorderProcessor`] inbound
+/// tap, so the recording's caller leg contains the gated speech only (silence
+/// between turns is silence-padded at render time by the wall-clock stamps, but
+/// the re-injected pre-roll lands ~[`SPEECH_GATE_PREROLL_MS`] late within its
+/// utterance). Transcription quality is the trade this builder makes.
 struct SpeechGate {
     open: bool,
     preroll: std::collections::VecDeque<i16>,
@@ -388,7 +450,8 @@ impl SpeechGate {
         Self {
             open: false,
             preroll: std::collections::VecDeque::new(),
-            preroll_cap: 4800, // 300 ms @16 kHz; rescaled in start()
+            // Rescaled to the negotiated input rate in `start()`.
+            preroll_cap: 16_000 * SPEECH_GATE_PREROLL_MS / 1000,
             sample_rate: 16_000,
         }
     }
@@ -402,7 +465,17 @@ impl FrameProcessor for SpeechGate {
 
     async fn start(&mut self, _s: &ProcessorSetup, p: &StartParams) -> Result<()> {
         self.sample_rate = p.audio_in_sample_rate;
-        self.preroll_cap = (self.sample_rate as usize * 3) / 10;
+        self.preroll_cap = self.sample_rate as usize * SPEECH_GATE_PREROLL_MS / 1000;
+        Ok(())
+    }
+
+    /// Barge-in: drop the pre-roll ring. On the VAD's own barge-in this is a
+    /// no-op (its `UserStartedSpeaking` leads the broadcast, so the ring was
+    /// already drained into the turn); it matters when the interruption comes
+    /// from elsewhere — an [`InterruptionStrategy`](crate::audio::strategy) —
+    /// where the ring holds bot echo rather than the caller's next utterance.
+    async fn on_interruption(&mut self) -> Result<()> {
+        self.preroll.clear();
         Ok(())
     }
 
@@ -412,14 +485,15 @@ impl FrameProcessor for SpeechGate {
                 if self.open {
                     link.push(env.meta, env.frame, env.direction).await;
                 } else {
+                    // Swallow the audio, keeping only the trailing pre-roll —
+                    // feeding a batch STT the inter-turn silence is what makes it
+                    // hallucinate turns.
                     for s in &audio.pcm {
                         if self.preroll.len() == self.preroll_cap {
                             self.preroll.pop_front();
                         }
                         self.preroll.push_back(*s);
                     }
-                    // Swallow the audio (nothing downstream of the gate needs
-                    // raw silence; inbound recording taps upstream of it).
                 }
             }
             Frame::UserStartedSpeaking => {
@@ -433,17 +507,10 @@ impl FrameProcessor for SpeechGate {
                 }
                 link.push(env.meta, env.frame, env.direction).await;
             }
+            // Close the gate and forward the edge: `SttProcessor` turns it into a
+            // `SttService::flush()`, which is what finalizes the utterance.
             Frame::UserStoppedSpeaking => {
-                if self.open {
-                    self.open = false;
-                    link.push_down(Frame::InputAudio(Arc::new(
-                        crate::processor::frame::AudioFrame::mono(
-                            vec![0i16; SPEECH_GATE_FLUSH_SAMPLES],
-                            self.sample_rate,
-                        ),
-                    )))
-                    .await;
-                }
+                self.open = false;
                 link.push(env.meta, env.frame, env.direction).await;
             }
             _ => link.push(env.meta, env.frame, env.direction).await,
@@ -717,10 +784,16 @@ impl FrameProcessor for AssistantContextAggregator {
         "AssistantContextAggregator"
     }
 
-    /// Barge-in context repair (duplex): keep what streamed so far as the
-    /// assistant turn (best available approximation of "what was spoken" for a
-    /// one-shot TTS with no word timestamps) and drop the open response span, so
-    /// a late `LlmResponseEnd` from a cancelled stream cannot speak the reply.
+    /// Barge-in context repair (duplex): commit what streamed so far as the
+    /// assistant turn — the best available approximation of "what was spoken" for
+    /// a one-shot TTS with no word timestamps, and better than losing the turn
+    /// entirely (the model would re-offer what it already said).
+    ///
+    /// Taking the buffer is also what stops the interrupted reply being spoken
+    /// *after* the barge-in: a late `LlmResponseEnd` from the cancelled stream now
+    /// finds an empty reply and emits no `TtsSpeak`. (Usually it never arrives —
+    /// `LlmResponseEnd` is interruptible, so the runtime's drain drops it — but
+    /// one racing in behind the interruption must be inert too.)
     async fn on_interruption(&mut self) -> Result<()> {
         self.in_response = false;
         let partial = std::mem::take(&mut self.buffer);
@@ -1105,10 +1178,9 @@ struct CascadedTransportOutput<T: MediaTransport> {
     turn_mute: TurnMute,
     /// Duplex mode: bot-speaking edge notifier for upstream VAD barge-in.
     bot_notifier: Option<BotSpeakingNotifier>,
-    /// Duplex mode: while true (set by the out-of-band interrupt reactor,
-    /// cleared when the frame-path `Interruption` reaches this sink), drop
-    /// arriving bot audio — it is a stale reply that outran its interruption.
-    suppress_stale: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Duplex mode: drops bot audio belonging to a reply that outran its own
+    /// interruption (see [`StaleAudioLatch`]).
+    suppress_stale: Option<Arc<StaleAudioLatch>>,
 }
 
 impl<T: MediaTransport> CascadedTransportOutput<T> {
@@ -1140,7 +1212,7 @@ impl<T: MediaTransport> CascadedTransportOutput<T> {
     }
 
     /// Duplex mode: stale-audio suppression latch shared with the reactor.
-    fn with_suppress_latch(mut self, latch: Arc<std::sync::atomic::AtomicBool>) -> Self {
+    fn with_suppress_latch(mut self, latch: Arc<StaleAudioLatch>) -> Self {
         self.suppress_stale = Some(latch);
         self
     }
@@ -1168,13 +1240,10 @@ impl<T: MediaTransport + 'static> FrameProcessor for CascadedTransportOutput<T> 
     }
 
     /// Barge-in: flush the carrier playback and drop the playout estimate.
-    /// (The `Frame::Interruption` arm in `process_frame` below is retained for
-    /// clarity but is unreachable — the runtime intercepts interruptions; this
-    /// hook is the delivery path.)
     async fn on_interruption(&mut self) -> Result<()> {
-        tracing::info!("sink: barge-in flush (send_clear)");
+        tracing::debug!("barge-in: flushing carrier playback");
         if let Some(latch) = &self.suppress_stale {
-            latch.store(false, std::sync::atomic::Ordering::SeqCst);
+            latch.clear();
         }
         if let Err(e) = self.transport.send_clear().await {
             self.fail_transport(e);
@@ -1205,7 +1274,7 @@ impl<T: MediaTransport + 'static> FrameProcessor for CascadedTransportOutput<T> 
                 // interrupted reply (the reactor flushed before the frame-path
                 // Interruption arrived here). Drop it.
                 if let Some(latch) = &self.suppress_stale {
-                    if latch.load(std::sync::atomic::Ordering::SeqCst) {
+                    if latch.is_stale() {
                         return Ok(());
                     }
                 }
@@ -1232,14 +1301,6 @@ impl<T: MediaTransport + 'static> FrameProcessor for CascadedTransportOutput<T> 
                     }
                     Err(e) => self.state.lock().unwrap().record_error(e),
                 }
-            }
-            // Barge-in: flush the carrier playback.
-            Frame::Interruption => {
-                if let Err(e) = self.transport.send_clear().await {
-                    self.fail_transport(e);
-                }
-                let _ = self.turn_mute.take_bot_until();
-                link.push(env.meta, env.frame, env.direction).await;
             }
             // End-of-call: wait out the final bot utterance still playing at the
             // carrier before teardown (mirrors the realtime sink — see s2s.rs).
@@ -1627,7 +1688,7 @@ where
     // the LLM adapter polls it between streamed chunks.
     let interrupt_flag = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let interrupt_notify = Arc::new(tokio::sync::Notify::new());
-    let suppress_latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let suppress_latch = Arc::new(StaleAudioLatch::new(interrupt_flag.clone()));
     let vad = vad
         .with_interrupt_flag(interrupt_flag.clone())
         .with_interrupt_notify(interrupt_notify.clone());
@@ -1646,8 +1707,8 @@ where
         tokio::spawn(async move {
             loop {
                 notify.notified().await;
-                tracing::info!("interrupt reactor: immediate carrier flush");
-                latch.store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::debug!("barge-in reactor: immediate carrier flush");
+                latch.arm();
                 if let Err(e) = transport.send_clear().await {
                     tracing::debug!(error = %e, "reactor send_clear failed");
                 }
@@ -2517,6 +2578,205 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cardiology"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Duplex (full-duplex barge-in) pieces.
+    // ----------------------------------------------------------------------
+
+    /// Records the `InputAudio` chunk sizes that make it past the gate.
+    #[derive(Clone, Default)]
+    struct AudioCapture(Arc<Mutex<Vec<usize>>>);
+    #[async_trait]
+    impl FrameProcessor for AudioCapture {
+        fn name(&self) -> &str {
+            "AudioCapture"
+        }
+        async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
+            if let Frame::InputAudio(a) = &env.frame {
+                self.0.lock().unwrap().push(a.pcm.len());
+            }
+            link.push(env.meta, env.frame, env.direction).await;
+            Ok(())
+        }
+    }
+
+    async fn run_gate(frames: Vec<Frame>) -> Vec<usize> {
+        let cap = AudioCapture::default();
+        let task = PipelineTask::new(
+            Pipeline::new(vec![Box::new(SpeechGate::new()), Box::new(cap.clone())]),
+            PipelineTaskParams::default(),
+            vec![],
+        );
+        for f in frames {
+            task.queue_frame(f).await;
+        }
+        task.stop_when_done().await;
+        tokio::time::timeout(Duration::from_secs(5), task.run())
+            .await
+            .expect("speech gate pipeline timed out")
+            .expect("run ok");
+        let out = cap.0.lock().unwrap().clone();
+        out
+    }
+
+    fn audio(n: usize) -> Frame {
+        Frame::InputAudio(Arc::new(AudioFrame::mono(vec![1i16; n], 16_000)))
+    }
+
+    /// The gate passes audio only between the VAD edges, and replays the buffered
+    /// pre-roll at the rising edge so the first phoneme isn't clipped. Everything
+    /// outside a turn is swallowed — feeding inter-turn silence to a fixed-window
+    /// batch STT is what makes it hallucinate turns.
+    #[tokio::test]
+    async fn speech_gate_passes_only_vad_delimited_audio_with_preroll() {
+        let out = run_gate(vec![
+            audio(100), // before the turn → pre-roll only
+            Frame::UserStartedSpeaking,
+            audio(50), // inside the turn → through
+            Frame::UserStoppedSpeaking,
+            audio(70), // after the turn → swallowed
+        ])
+        .await;
+        assert_eq!(
+            out,
+            vec![100, 50],
+            "expected the replayed pre-roll then the in-turn audio"
+        );
+    }
+
+    /// The pre-roll is a bounded ring: only the last `SPEECH_GATE_PREROLL_MS` of
+    /// pre-speech audio is replayed, however long the silence before the turn was.
+    #[tokio::test]
+    async fn speech_gate_preroll_is_bounded_to_the_configured_window() {
+        let cap = 16_000 * SPEECH_GATE_PREROLL_MS / 1000;
+        let out = run_gate(vec![
+            audio(cap * 3),
+            Frame::UserStartedSpeaking,
+            Frame::UserStoppedSpeaking,
+        ])
+        .await;
+        assert_eq!(out, vec![cap], "pre-roll must be capped at the window");
+    }
+
+    /// The gate emits no marker audio of its own at the falling edge — finalizing
+    /// the utterance is `SttService::flush`'s job, driven by the forwarded
+    /// `UserStoppedSpeaking`. Guards against re-introducing a magic silent chunk
+    /// that only an STT in on the convention could recognize.
+    #[tokio::test]
+    async fn speech_gate_emits_no_synthetic_flush_audio() {
+        let out = run_gate(vec![
+            Frame::UserStartedSpeaking,
+            audio(32),
+            Frame::UserStoppedSpeaking,
+        ])
+        .await;
+        assert_eq!(out, vec![32]);
+    }
+
+    /// The bot-speaking edges the cascaded chain never emitted: without them
+    /// `VadProcessor` keeps `bot_speaking == false` and its barge-in broadcast is
+    /// permanently disarmed.
+    #[tokio::test]
+    async fn bot_speaking_notifier_emits_started_then_stopped_edges() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n = BotSpeakingNotifier::new(tx, 16_000);
+
+        n.note_audio(160); // 10 ms of carrier audio
+        assert!(matches!(rx.recv().await, Some(Frame::BotStartedSpeaking)));
+
+        // A second chunk inside the same burst must not re-announce the start.
+        n.note_audio(160);
+
+        // The watchdog emits the stopped edge once the playout estimate runs dry.
+        let stopped = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("watchdog never emitted BotStoppedSpeaking");
+        assert!(matches!(stopped, Some(Frame::BotStoppedSpeaking)));
+    }
+
+    /// Barge-in cuts the burst short: the stopped edge fires immediately (rather
+    /// than at the end of the flushed-away playout) and exactly once.
+    #[tokio::test]
+    async fn bot_speaking_notifier_stops_immediately_on_interruption() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n = BotSpeakingNotifier::new(tx, 16_000);
+
+        n.note_audio(16_000); // 1 s of audio queued
+        assert!(matches!(rx.recv().await, Some(Frame::BotStartedSpeaking)));
+
+        n.on_interruption();
+        assert!(matches!(rx.recv().await, Some(Frame::BotStoppedSpeaking)));
+
+        // The superseded watchdog must exit silently, not emit a second edge.
+        n.on_interruption();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a second BotStoppedSpeaking would re-arm the VAD gate spuriously"
+        );
+    }
+
+    /// The reactor and the frame-path `Interruption` are woken independently, so
+    /// either can reach the latch first. Regression: a plain bool armed by the
+    /// reactor *after* the sink had already cleared it stayed set forever, and the
+    /// sink silently dropped every subsequent reply — the bot went mute for the
+    /// rest of the call.
+    #[test]
+    fn stale_audio_latch_is_order_independent() {
+        let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let latch = StaleAudioLatch::new(gen.clone());
+        assert!(!latch.is_stale(), "idle: nothing to suppress");
+
+        // Barge-in #1, reactor first (the common case): audio arriving between the
+        // reactor's flush and the sink's hook belongs to the interrupted reply.
+        gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        latch.arm();
+        assert!(latch.is_stale());
+        latch.clear();
+        assert!(!latch.is_stale(), "the sink's hook re-opens the sink");
+
+        // Barge-in #2, sink first: the late arm must not wedge the latch on.
+        gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        latch.clear();
+        latch.arm();
+        assert!(
+            !latch.is_stale(),
+            "an arm for an already-acknowledged barge-in must not mute the sink"
+        );
+
+        // A stale arm from a superseded generation can't walk the latch backwards.
+        gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        latch.arm();
+        latch.clear();
+        latch.arm();
+        assert!(!latch.is_stale());
+    }
+
+    /// Barge-in context repair: the partially streamed reply is kept as the
+    /// assistant turn (the model must not re-offer what it already said) and the
+    /// buffer is cleared, so a late `LlmResponseEnd` from the cancelled stream
+    /// cannot assemble the full reply and speak it after the interruption.
+    #[tokio::test]
+    async fn assistant_aggregator_keeps_the_partial_reply_and_drops_the_span() {
+        let ctx: SharedContext = Arc::new(Mutex::new(RollingContext::new(None, vec![])));
+        let mut agg = AssistantContextAggregator::new(ctx.clone());
+        agg.in_response = true;
+        agg.buffer = "the first part of the rep".to_string();
+
+        agg.on_interruption().await.expect("hook ok");
+
+        let snap = ctx.lock().unwrap().snapshot();
+        assert_eq!(snap.messages.len(), 1);
+        assert_eq!(snap.messages[0]["role"], "assistant");
+        assert_eq!(snap.messages[0]["content"], "the first part of the rep");
+        assert!(agg.buffer.is_empty(), "the open span must be dropped");
+        assert!(!agg.in_response);
+
+        // Idempotent: a second interruption before any new text adds nothing.
+        agg.on_interruption().await.expect("hook ok");
+        assert_eq!(ctx.lock().unwrap().snapshot().messages.len(), 1);
     }
 
     #[test]

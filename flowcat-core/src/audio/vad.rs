@@ -347,6 +347,8 @@ pub struct VadProcessor<V: VadAnalyzer> {
     /// `Interruption` can stall behind any hop that is mid-`await` (observed
     /// live: 14 ms vs 2.1 s sink delivery depending on TTS activity); a
     /// dedicated reactor task woken here can flush playback immediately.
+    /// Signalled with `notify_one`, so a barge-in raised while the reactor is
+    /// still handling the previous one is stored rather than lost.
     interrupt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
@@ -407,12 +409,12 @@ impl<V: VadAnalyzer> VadProcessor<V> {
                     .await;
                 link.push_down(Frame::UserStartedSpeaking).await;
                 if self.bot_speaking && self.interrupt_on_barge_in {
-                    tracing::info!("vad barge-in: user speech while bot speaking");
+                    tracing::debug!("barge-in: user speech while bot speaking");
                     if let Some(flag) = &self.interrupt_flag {
                         flag.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     if let Some(n) = &self.interrupt_notify {
-                        n.notify_waiters();
+                        n.notify_one();
                     }
                     link.broadcast(Frame::Interruption).await;
                 }

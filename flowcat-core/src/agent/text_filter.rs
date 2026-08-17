@@ -527,6 +527,12 @@ impl<A: TextAggregator + 'static> FrameProcessor for TextAggregatorProcessor<A> 
         self.name
     }
 
+    /// Barge-in: drop the half-built sentence so the next turn doesn't inherit it.
+    async fn on_interruption(&mut self) -> Result<()> {
+        self.agg.reset();
+        Ok(())
+    }
+
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         match &env.frame {
             Frame::LlmText(t) | Frame::Text(t) => {
@@ -548,10 +554,6 @@ impl<A: TextAggregator + 'static> FrameProcessor for TextAggregatorProcessor<A> 
                         link.push_down(Frame::Text(tail)).await;
                     }
                 }
-                link.push(env.meta, env.frame, env.direction).await;
-            }
-            Frame::Interruption => {
-                self.agg.reset();
                 link.push(env.meta, env.frame, env.direction).await;
             }
             _ => {
@@ -583,6 +585,12 @@ impl<F: TextFilter + 'static> FrameProcessor for TextFilterProcessor<F> {
         self.name
     }
 
+    /// Barge-in: reset the filter's carry-over state for the next turn.
+    async fn on_interruption(&mut self) -> Result<()> {
+        self.filter.reset();
+        Ok(())
+    }
+
     async fn process_frame(&mut self, env: Envelope, link: &Link) -> Result<()> {
         match env.frame {
             Frame::LlmText(t) => {
@@ -599,11 +607,6 @@ impl<F: TextFilter + 'static> FrameProcessor for TextFilterProcessor<F> {
                         .await;
                 }
             }
-            Frame::Interruption => {
-                self.filter.reset();
-                link.push(env.meta, Frame::Interruption, env.direction)
-                    .await;
-            }
             other => {
                 link.push(env.meta, other, env.direction).await;
             }
@@ -615,7 +618,7 @@ impl<F: TextFilter + 'static> FrameProcessor for TextFilterProcessor<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_harness::drive;
+    use crate::agent::test_harness::{drive, drive_ref};
     use crate::processor::frame::Direction;
 
     #[test]
@@ -722,6 +725,66 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["Hi there.", "Bye now."]);
+    }
+
+    /// Barge-in resets the half-built sentence. `Frame::Interruption` is a
+    /// lifecycle frame the runtime intercepts, so it never reaches
+    /// `process_frame` — the reset has to hang off `on_interruption`, or the next
+    /// turn inherits the abandoned fragment.
+    #[tokio::test]
+    async fn aggregator_processor_resets_the_buffer_on_interruption() {
+        let mut proc = TextAggregatorProcessor::new("agg", SimpleTextAggregator::new());
+        // A fragment with no sentence end stays buffered.
+        let out = drive_ref(
+            &mut proc,
+            vec![Frame::LlmText("half a sen".into())],
+            Direction::Downstream,
+        )
+        .await;
+        assert!(
+            out.is_empty(),
+            "an unterminated fragment must not be emitted"
+        );
+
+        proc.on_interruption().await.expect("hook ok");
+
+        // After the reset the next turn starts clean — the abandoned fragment is
+        // not prefixed onto it.
+        let out = drive_ref(
+            &mut proc,
+            vec![Frame::LlmText("Brand new sentence. Next".into())],
+            Direction::Downstream,
+        )
+        .await;
+        assert!(
+            matches!(out.first(), Some(Frame::Text(t)) if t == "Brand new sentence."),
+            "got {out:?}"
+        );
+    }
+
+    /// Same for the filter processor: the hook is the only delivery path for a
+    /// barge-in reset.
+    #[tokio::test]
+    async fn filter_processor_resets_on_interruption() {
+        let mut proc = TextFilterProcessor::new("md", MarkdownTextFilter::default());
+        // An unbalanced fence leaves the filter in "inside a code block" state.
+        let _ = drive_ref(
+            &mut proc,
+            vec![Frame::LlmText("```rust\nlet x = 1;".into())],
+            Direction::Downstream,
+        )
+        .await;
+        proc.on_interruption().await.expect("hook ok");
+        let out = drive_ref(
+            &mut proc,
+            vec![Frame::LlmText("**hello**".into())],
+            Direction::Downstream,
+        )
+        .await;
+        assert!(
+            matches!(out.first(), Some(Frame::LlmText(t)) if t == "hello"),
+            "a reset filter must treat the next turn as fresh prose; got {out:?}"
+        );
     }
 
     #[tokio::test]

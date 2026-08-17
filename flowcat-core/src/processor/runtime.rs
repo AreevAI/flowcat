@@ -11,8 +11,9 @@
 //!   interruption can never block on a full queue.
 //!
 //! The loop biases the system channel, runs the processor's lifecycle hooks on
-//! lifecycle frames, drains interruptible frames on [`Frame::Interruption`], and
-//! converts a `process_frame` `Err` into an upstream [`Frame::Error`].
+//! lifecycle frames, drains interruptible frames on [`Frame::Interruption`] (then
+//! calls [`FrameProcessor::on_interruption`]), and converts a `process_frame`
+//! `Err` into an upstream [`Frame::Error`].
 
 use tokio::sync::mpsc;
 
@@ -98,8 +99,8 @@ fn stop_reason(frame: &Frame) -> StopReason {
 /// - `biased` select drains the **system** channel first (priority);
 /// - `Start` runs `start()` then forwards;
 /// - `Interruption` drains the normal queue of *interruptible* frames (keeping
-///   uninterruptible ones — End/Stop/FunctionCallResult/UpdateSettings) then
-///   forwards;
+///   uninterruptible ones — End/Stop/FunctionCallResult/UpdateSettings), calls
+///   `on_interruption()`, then forwards;
 /// - `End`/`Stop`/`Cancel` run `stop()`, forward, and (End/Cancel) break;
 /// - any other frame goes to `process_frame`; an `Err` becomes an upstream
 ///   `Error{fatal:false}`.
@@ -142,8 +143,10 @@ pub async fn run_processor(
                 // uninterruptible ones. A kept *downstream terminal* (End/Stop) is
                 // returned rather than blindly forwarded — see below.
                 let kept_terminal = drain_on_interruption(&mut rx, &link).await;
-                // Give the processor its barge-in hook (see
-                // `FrameProcessor::on_interruption`) before the frame moves on.
+                // Barge-in hook: the processor reacts (flush playback, reset an
+                // aggregator, repair context) on a queue that is already clean.
+                // `Interruption` never reaches `process_frame` — this is the only
+                // delivery path (PROCESSOR-DESIGN §2.5).
                 if let Err(e) = p.on_interruption().await {
                     link.push_error(e.to_string(), false).await;
                 }
@@ -312,5 +315,118 @@ mod tests {
             stopped.load(Ordering::Relaxed),
             "the Sink's stop() hook must run for the buffered End (else PipelineTask hangs)"
         );
+    }
+
+    /// Records the order in which the runtime ran hooks vs. delivered data frames.
+    struct HookOrderTap {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait]
+    impl FrameProcessor for HookOrderTap {
+        fn name(&self) -> &str {
+            "HookOrderTap"
+        }
+        async fn on_interruption(&mut self) -> Result<()> {
+            self.log.lock().unwrap().push("on_interruption");
+            Ok(())
+        }
+        async fn process_frame(&mut self, env: Envelope, _link: &Link) -> Result<()> {
+            self.log.lock().unwrap().push(env.frame.name());
+            Ok(())
+        }
+    }
+
+    /// `Frame::Interruption` is intercepted by the runtime and never reaches
+    /// `process_frame` — `on_interruption` is the only delivery path, and it runs
+    /// *after* the interruptible backlog is drained (so the hook sees a clean
+    /// queue). Regression for barge-in reactions silently never firing.
+    #[tokio::test]
+    async fn interruption_calls_the_hook_and_never_reaches_process_frame() {
+        let name: Arc<str> = Arc::from("HookOrderTap");
+        let (tx, rx) = channel(name.clone(), 8);
+        let clock = Clock::new();
+        let setup = ProcessorSetup {
+            clock: clock.clone(),
+            observer: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            enable_metrics: false,
+            enable_usage_metrics: false,
+        };
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let p = Box::new(HookOrderTap { log: log.clone() });
+
+        // An interruptible data frame is already queued when the interruption lands.
+        tx.send(Envelope::new(
+            Frame::Text("stale".into()),
+            Direction::Downstream,
+        ))
+        .await;
+        tx.send(Envelope::new(Frame::Interruption, Direction::Downstream))
+            .await;
+        drop(tx);
+
+        let h = tokio::spawn(run_processor(p, rx, sink_link(name, clock), setup));
+        tokio::time::timeout(std::time::Duration::from_secs(2), h)
+            .await
+            .expect("run_processor hung")
+            .expect("run_processor panicked");
+
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            !seen.contains(&"Interruption"),
+            "Interruption must not reach process_frame, got {seen:?}"
+        );
+        assert_eq!(
+            seen,
+            vec!["on_interruption"],
+            "the hook runs exactly once, and the stale interruptible backlog is \
+             drained rather than delivered, got {seen:?}"
+        );
+    }
+
+    /// An `Err` from `on_interruption` becomes a non-fatal upstream `Error`
+    /// instead of killing the task — same contract as `process_frame`.
+    #[tokio::test]
+    async fn on_interruption_error_is_reported_and_the_task_survives() {
+        struct Failing;
+        #[async_trait]
+        impl FrameProcessor for Failing {
+            fn name(&self) -> &str {
+                "Failing"
+            }
+            async fn on_interruption(&mut self) -> Result<()> {
+                Err(crate::error::FlowcatError::Other("boom".into()))
+            }
+        }
+
+        let name: Arc<str> = Arc::from("Failing");
+        let (tx, rx) = channel(name.clone(), 8);
+        let clock = Clock::new();
+        let setup = ProcessorSetup {
+            clock: clock.clone(),
+            observer: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            enable_metrics: false,
+            enable_usage_metrics: false,
+        };
+        tx.send(Envelope::new(Frame::Interruption, Direction::Downstream))
+            .await;
+        tx.send(Envelope::new(
+            Frame::End { reason: None },
+            Direction::Downstream,
+        ))
+        .await;
+        drop(tx);
+
+        let h = tokio::spawn(run_processor(
+            Box::new(Failing),
+            rx,
+            sink_link(name, clock),
+            setup,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), h)
+            .await
+            .expect("a failing on_interruption must not hang the task")
+            .expect("run_processor panicked");
     }
 }
