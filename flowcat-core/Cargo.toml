@@ -64,7 +64,7 @@ bytes = "1"
 # `transport::{websocket,tls}` modules are NOT cfg-gated, so disabling those
 # features leaves their tungstenite/rustls-typed bodies uncompilable. We only
 # *use* the UDP transport; the others are dead code that still must build.
-rsipstack = "0.5"
+rsipstack = "0.6"
 # rsipstack manages its own subtasks via a shared CancellationToken; we hold
 # one per SipAgent to drive the listener/registration loop and tear it down.
 tokio-util = { version = "0.7", features = ["rt"] }
