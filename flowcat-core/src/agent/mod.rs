@@ -43,6 +43,17 @@ pub(crate) mod test_harness {
         frames: Vec<Frame>,
         direction: Direction,
     ) -> Vec<Frame> {
+        drive_ref(proc.as_mut(), frames, direction).await
+    }
+
+    /// [`drive`] against a borrowed processor, so a test can drive it, poke a
+    /// lifecycle hook (`on_interruption`), and drive it again — asserting on state
+    /// carried *across* turns.
+    pub(crate) async fn drive_ref(
+        proc: &mut dyn FrameProcessor,
+        frames: Vec<Frame>,
+        direction: Direction,
+    ) -> Vec<Frame> {
         // One capture channel acts as both the downstream and upstream neighbour.
         let (cap_tx, mut cap_rx) = channel(Arc::from("capture"), NORMAL_CHAN_CAP);
         let link = Link {

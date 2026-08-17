@@ -43,6 +43,18 @@ pub trait SttService: Send {
     /// Feed one audio chunk; transcript frames are returned for the processor to
     /// forward downstream.
     async fn run_stt(&mut self, audio: Arc<AudioFrame>) -> Result<Vec<Frame>>;
+    /// End-of-utterance: transcribe whatever is still buffered and return it.
+    ///
+    /// Called by [`SttProcessor`](crate::service::adapters::SttProcessor) on
+    /// [`Frame::UserStoppedSpeaking`], i.e. only when something upstream (a
+    /// [`VadProcessor`](crate::audio::VadProcessor)) actually does endpointing.
+    /// A *fixed-window batch* service (whisper.cpp) needs this: without it the
+    /// tail of an utterance sits in its buffer until enough later audio arrives
+    /// to cross the window, which splits turns at arbitrary boundaries. A
+    /// *streaming* service does its own endpointing — the default no-op is right.
+    async fn flush(&mut self) -> Result<Vec<Frame>> {
+        Ok(vec![])
+    }
     async fn set_muted(&mut self, muted: bool);
 }
 
@@ -89,6 +101,9 @@ impl SttService for Box<dyn SttService> {
     }
     async fn run_stt(&mut self, audio: Arc<AudioFrame>) -> Result<Vec<Frame>> {
         (**self).run_stt(audio).await
+    }
+    async fn flush(&mut self) -> Result<Vec<Frame>> {
+        (**self).flush().await
     }
     async fn set_muted(&mut self, muted: bool) {
         (**self).set_muted(muted).await

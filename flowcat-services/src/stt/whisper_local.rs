@@ -307,6 +307,23 @@ impl SttService for WhisperLocalStt {
         Self::transcribe_segment(ctx, self.language.clone(), samples).await
     }
 
+    /// End-of-utterance (a VAD falling edge upstream): transcribe the buffered
+    /// tail regardless of the segment threshold. Without this the last (partial)
+    /// window of every turn waits for the *next* turn's audio to push it over the
+    /// threshold, which merges two utterances into one late transcript.
+    async fn flush(&mut self) -> Result<Vec<Frame>> {
+        if self.muted || self.buffer.is_empty() {
+            return Ok(vec![]);
+        }
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| FlowcatError::Other("whisper_local: flush before start".into()))?
+            .clone();
+        let samples = self.buffer.drain();
+        Self::transcribe_segment(ctx, self.language.clone(), samples).await
+    }
+
     async fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
     }
