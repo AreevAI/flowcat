@@ -174,7 +174,7 @@ obs-all      = ["obs-otel", "obs-sentry", "obs-langfuse"]
 
 [dependencies]
 # Always on: the frozen service traits + Frame enum the impls build against.
-flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.1" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

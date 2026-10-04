@@ -917,7 +917,7 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "flowcat-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "audio-codec-algorithms",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-services"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-telephony"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.0",
  "flowcat-core",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "flowcat-transports"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "audiopus",

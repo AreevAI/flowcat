@@ -14,9 +14,9 @@ name = "flowcat"
 path = "src/main.rs"
 
 [dependencies]
-flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.1" }
 # The generic WebSocket media transport (`WsTransport`) used by the `ws-echo` demo.
-flowcat-transports = { path = "../flowcat-transports", version = "0.1.0", features = ["ws"] }
+flowcat-transports = { path = "../flowcat-transports", version = "0.1.1", features = ["ws"] }
 # `#[async_trait]` for the demo `FrameProcessor`/`FrameObserver` impls (same
 # version flowcat-core/-transports use).
 async-trait = "0.1"

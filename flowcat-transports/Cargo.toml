@@ -29,7 +29,7 @@ livekit      = []
 local        = ["dep:audiopus", "dep:tokio"]
 
 [dependencies]
-flowcat-core = { path = "../flowcat-core", version = "0.1.0" }
+flowcat-core = { path = "../flowcat-core", version = "0.1.1" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

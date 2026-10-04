@@ -8,6 +8,22 @@ onward. Until then (pre-1.0), minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-04
+
+### Added
+- Perplexity requests carry an `X-Pplx-Integration: flowcat` header so the
+  traffic can be identified in provider telemetry; the shared OpenAI-compatible
+  client gained an opt-in `headers` builder (other providers are unchanged).
+- Full-duplex support for the cascaded pipeline, KittenTTS (self-hosted), NVIDIA
+  Riva STT, Sarvam STT/TTS model and language options, and `ContextRelay`
+  long-call memory for realtime calls.
+
+### Changed
+- Dependency updates (rubato 4, str0m 0.21, tokio-tungstenite 0.30, and others)
+  and fixes for newer Rust 1.99 clippy lints.
+
+## [0.1.0] - 2026-06-15
+
 ### Added
 - `flowcat-cli` ships two runnable, credential-free demos (the OSS examples
   surface): `pipeline` (an in-process `FrameProcessor` pipeline over a synthetic
