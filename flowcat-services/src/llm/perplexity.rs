@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use flowcat_core::error::Result;
 use flowcat_core::processor::frame::{Frame, LlmContext, StartParams};
@@ -21,6 +22,13 @@ use super::{OpenAiLlm, OpenAiLlmBuilder};
 pub const PERPLEXITY_API_BASE: &str = "https://api.perplexity.ai";
 /// Perplexity's default model.
 pub const PERPLEXITY_DEFAULT_MODEL: &str = "sonar";
+
+fn request_headers() -> HeaderMap {
+    HeaderMap::from_iter([(
+        HeaderName::from_static("x-pplx-integration"),
+        HeaderValue::from_static("flowcat"),
+    )])
+}
 
 /// Perplexity LLM service — an [`OpenAiLlm`] pointed at the Perplexity base URL.
 pub struct PerplexityLlm {
@@ -38,6 +46,7 @@ impl PerplexityLlm {
         let inner = OpenAiLlmBuilder::new(api_key)
             .base_url(PERPLEXITY_API_BASE)
             .model(model)
+            .headers(request_headers())
             .build();
         Self { inner }
     }
@@ -73,6 +82,14 @@ mod tests {
         assert_eq!(
             PerplexityLlm::with_model("k", "custom").name(),
             "perplexity"
+        );
+    }
+
+    #[test]
+    fn sets_integration_header() {
+        assert_eq!(
+            request_headers().get("x-pplx-integration"),
+            Some(&HeaderValue::from_static("flowcat"))
         );
     }
 }

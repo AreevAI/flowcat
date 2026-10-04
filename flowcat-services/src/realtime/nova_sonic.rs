@@ -277,8 +277,10 @@ fn pcm_to_le_bytes(pcm: &[i16]) -> Vec<u8> {
 #[allow(dead_code)]
 fn le_bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect()
 }
 

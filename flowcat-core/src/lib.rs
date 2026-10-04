@@ -29,6 +29,10 @@
 //! See `DESIGN.md` for the full design (crate layout, trait contracts, audio
 //! path, Gemini Live protocol).
 
+// `#[async_trait]` expands to `#[must_use]` on a boxed future that is already
+// `#[must_use]`; newer clippy flags the generated code, not ours.
+#![allow(clippy::double_must_use)]
+
 pub mod agent;
 pub mod audio;
 pub mod brain;

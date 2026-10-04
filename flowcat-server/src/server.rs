@@ -297,6 +297,7 @@ where
 /// per-run graph (and reject an already-completed run), and the factory turns that
 /// resolved config into the brain. On any failure it returns the [`Response`] to
 /// send (the caller `?`-style early-returns it), so the socket/peer is never set up.
+#[allow(clippy::result_large_err)] // the `Err` is the ready-to-send HTTP `Response`.
 pub(crate) async fn resolve_brain<S, B>(
     state: &AppState<S, B>,
     run_id: i64,

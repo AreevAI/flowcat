@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 use flowcat_core::error::{FlowcatError, Result};
@@ -38,6 +39,7 @@ pub struct OpenAiLlmBuilder {
     api_key: String,
     base_url: String,
     model: String,
+    headers: HeaderMap,
 }
 
 impl OpenAiLlmBuilder {
@@ -47,6 +49,7 @@ impl OpenAiLlmBuilder {
             api_key: api_key.into(),
             base_url: OPENAI_API_BASE.to_string(),
             model: "gpt-4o".to_string(),
+            headers: HeaderMap::new(),
         }
     }
 
@@ -63,6 +66,12 @@ impl OpenAiLlmBuilder {
         self
     }
 
+    /// Add headers to every request made by this client.
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> OpenAiLlm {
         OpenAiLlm {
@@ -70,6 +79,7 @@ impl OpenAiLlmBuilder {
             api_key: self.api_key,
             base_url: self.base_url,
             model: self.model,
+            headers: self.headers,
             tools: Vec::new(),
         }
     }
@@ -81,6 +91,7 @@ pub struct OpenAiLlm {
     api_key: String,
     base_url: String,
     model: String,
+    headers: HeaderMap,
     tools: Vec<Tool>,
 }
 
@@ -150,6 +161,7 @@ impl LlmService for OpenAiLlm {
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
+            .headers(self.headers.clone())
             .json(&body)
             .send()
             .await
@@ -471,6 +483,7 @@ mod tests {
             .build();
         assert_eq!(llm.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(llm.model, "anthropic/claude-3.5");
+        assert!(llm.headers.is_empty());
     }
 
     #[test]
