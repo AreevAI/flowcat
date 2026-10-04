@@ -25,6 +25,10 @@
 //! NEW realtime providers live here. Moving Gemini into this crate is deferred
 //! (it would break the embedder's workspace build).
 
+// `#[async_trait]` expands to `#[must_use]` on a boxed future that is already
+// `#[must_use]`; newer clippy flags the generated code, not ours.
+#![allow(clippy::double_must_use)]
+
 pub mod realtime;
 
 pub mod stt;

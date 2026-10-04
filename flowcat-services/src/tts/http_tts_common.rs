@@ -157,8 +157,10 @@ pub fn tts_frames(pcm: Vec<i16>, sample_rate: u32, context_id: Arc<str>) -> Vec<
 /// never panics on an odd-length body).
 pub fn pcm_from_le_bytes(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect()
 }
 
@@ -178,9 +180,11 @@ pub fn strip_wav_header(bytes: &[u8]) -> &[u8] {
 /// (`< 4` bytes) is dropped — never panics.
 pub fn float32_le_to_i16(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| {
-            let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let f = f32::from_le_bytes(*c);
             (f.clamp(-1.0, 1.0) * 32767.0) as i16
         })
         .collect()

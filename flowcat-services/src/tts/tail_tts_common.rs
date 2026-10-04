@@ -24,8 +24,10 @@ use flowcat_core::processor::frame::{AudioFrame, Frame};
 /// Decode little-endian i16 PCM bytes into samples (drops a trailing odd byte).
 pub fn pcm_s16le(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect()
 }
 
