@@ -519,6 +519,7 @@ impl DialogHandle {
     }
 
     /// Send a BYE to end the dialog (no-op/`Err` if it is already terminated).
+    #[allow(clippy::result_large_err)] // `rsipstack::Error` is large; not ours to box.
     async fn bye(&self) -> rsipstack::Result<()> {
         match self {
             DialogHandle::Server(d) => d.bye().await,

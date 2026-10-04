@@ -315,7 +315,7 @@ impl JitterBuffer {
 
     /// Drain everything still buffered, in sequence order (end-of-call flush).
     pub fn drain(&mut self) -> Vec<RtpPacket> {
-        let out: Vec<RtpPacket> = self.buf.drain(..).collect();
+        let out: Vec<RtpPacket> = std::mem::take(&mut self.buf);
         if let Some(last) = out.last() {
             self.last_released = Some(last.seq);
             self.primed = true;
