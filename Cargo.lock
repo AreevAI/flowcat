@@ -2620,9 +2620,9 @@ dependencies = [
 
 [[package]]
 name = "rsipstack"
-version = "0.5.20"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af8b80977f2f85bd21b8acce7a18b95cb1d0a222f772d15a319a7b814e0daabd"
+checksum = "b50fa6f8b55f7c894a97a716242f238f72afe50e5b1c3fffc6cdd7ef8a9ec3ee"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
